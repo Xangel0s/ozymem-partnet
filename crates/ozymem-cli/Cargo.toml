@@ -20,3 +20,4 @@ ozymem-parser = { path = "../ozymem-parser" }
 tokio.workspace = true
 walkdir = "2.4"
 notify = "6.1.1"
+dialoguer = "0.11"

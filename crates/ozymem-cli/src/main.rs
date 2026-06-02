@@ -54,6 +54,7 @@ enum Commands {
         depth: u32,
     },
     Update,
+    Ignore,
     Watch {
         #[arg(default_value = ".")]
         path: String,
@@ -102,6 +103,7 @@ async fn main() -> anyhow::Result<()> {
             print_tree(&context.connection, &file_path, depth).await?
         }
         Commands::Update => run_update().await?,
+        Commands::Ignore => run_ignore().await?,
         Commands::Watch { path } => run_watch(&context, &path).await?,
     }
 
@@ -177,21 +179,42 @@ async fn scan_directory(
     let canonical_target = canonicalize_target(target_path)?;
     if reset {
         connection.clear_graph().await?;
-        println!("Memgraph reset completed");
+        println!("[Core] Estructura física del grafo purgada. Conservando base de conocimientos a largo plazo.");
     }
 
     println!("Scanning directory: {}", canonical_target.display());
 
     let mut rust_dependency_batches: Vec<RustDependencyBatch> = Vec::new();
+    let ignore_patterns = load_ignore_patterns();
+    let should_descend_fn = |entry: &DirEntry| {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            return true;
+        };
+
+        if name == ".git" || name == "node_modules" || name == "target" || name.starts_with('.') {
+            return false;
+        }
+
+        if is_ignored_by_patterns(path, &ignore_patterns) {
+            return false;
+        }
+
+        true
+    };
 
     for entry in WalkDir::new(&canonical_target)
         .into_iter()
-        .filter_entry(should_descend)
+        .filter_entry(should_descend_fn)
         .filter_map(Result::ok)
     {
         let path = entry.path();
 
         if !path.is_file() {
+            continue;
+        }
+
+        if is_ignored_by_patterns(path, &ignore_patterns) {
             continue;
         }
 
@@ -684,6 +707,10 @@ fn canonicalize_deleted_path(path: &Path) -> Option<PathBuf> {
 }
 
 fn should_process_delete(path: &Path) -> bool {
+    let ignore_patterns = load_ignore_patterns();
+    if is_ignored_by_patterns(path, &ignore_patterns) {
+        return false;
+    }
     if is_binary_file(path) {
         return false;
     }
@@ -698,6 +725,10 @@ fn should_process_delete(path: &Path) -> bool {
 }
 
 fn should_watch_path(path: &Path) -> bool {
+    let ignore_patterns = load_ignore_patterns();
+    if is_ignored_by_patterns(path, &ignore_patterns) {
+        return false;
+    }
     if !path.is_file() {
         return false;
     }
@@ -753,13 +784,92 @@ fn canonicalize_file(file_path: &str) -> anyhow::Result<PathBuf> {
     canonicalize_target(file_path)
 }
 
-fn should_descend(entry: &DirEntry) -> bool {
-    let path = entry.path();
-    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-        return true;
+fn load_ignore_patterns() -> Vec<String> {
+    if let Ok(content) = fs::read_to_string(".ozymemignore") {
+        content
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .collect()
+    } else {
+        Vec::new()
+    }
+}
+
+fn is_ignored_by_patterns(path: &Path, patterns: &[String]) -> bool {
+    if patterns.is_empty() {
+        return false;
+    }
+    let cleaned_path_str = clean_path(path);
+    let cleaned_path = Path::new(&cleaned_path_str);
+
+    let relative_path = if let Ok(current_dir) = std::env::current_dir() {
+        let cleaned_current_str = clean_path(&current_dir);
+        let cleaned_current = Path::new(&cleaned_current_str);
+        if let Ok(rel) = cleaned_path.strip_prefix(cleaned_current) {
+            rel.to_path_buf()
+        } else {
+            cleaned_path.to_path_buf()
+        }
+    } else {
+        cleaned_path.to_path_buf()
     };
 
-    !matches!(name, ".git" | "node_modules" | "target") && !name.starts_with('.')
+    let rel_str = relative_path.to_string_lossy().replace('\\', "/");
+    let rel_str_lower = rel_str.to_lowercase();
+
+    for pattern in patterns {
+        let pattern_lower = pattern.to_lowercase().replace('\\', "/");
+        if rel_str_lower == pattern_lower {
+            return true;
+        }
+        let prefix_dir = format!("{}/", pattern_lower);
+        if rel_str_lower.starts_with(&prefix_dir) {
+            return true;
+        }
+        for component in relative_path.components() {
+            if let Some(comp_str) = component.as_os_str().to_str() {
+                if comp_str.to_lowercase() == pattern_lower {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+async fn run_ignore() -> anyhow::Result<()> {
+    let current_dir = std::env::current_dir()?;
+    let mut entries = Vec::new();
+    for entry in fs::read_dir(&current_dir)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name == ".git" {
+            continue;
+        }
+        entries.push(name);
+    }
+    entries.sort();
+
+    if entries.is_empty() {
+        println!("No files or directories found in the current directory.");
+        return Ok(());
+    }
+
+    use dialoguer::{theme::ColorfulTheme, MultiSelect};
+    let selections = MultiSelect::with_theme(&ColorfulTheme::default())
+        .with_prompt("Selecciona los archivos/directorios a ignorar (flechas para mover, espacio para marcar, enter para confirmar)")
+        .items(&entries)
+        .interact()?;
+
+    let mut ignore_file = fs::File::create(".ozymemignore")?;
+    use std::io::Write;
+    for index in selections {
+        writeln!(ignore_file, "{}", entries[index])?;
+    }
+
+    println!("[Config] Archivo .ozymemignore guardado correctamente.");
+    Ok(())
 }
 
 fn get_language_from_path(path: &Path) -> SupportedLanguage {

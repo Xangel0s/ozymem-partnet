@@ -80,7 +80,7 @@ impl MemgraphConnection {
     }
 
     pub async fn clear_graph(&self) -> anyhow::Result<()> {
-        self.graph.run(query("MATCH (n) DETACH DELETE n")).await?;
+        self.graph.run(query("MATCH (n) WHERE n:File OR n:Function DETACH DELETE n")).await?;
         Ok(())
     }
 
