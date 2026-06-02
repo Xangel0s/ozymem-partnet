@@ -322,6 +322,29 @@ async fn scan_directory(
     force: bool,
 ) -> anyhow::Result<()> {
     let canonical_target = canonicalize_target(target_path)?;
+
+    // Validación del entorno: Debe estar registrado en ozymem.toml
+    if !force {
+        let mut path_is_registered = false;
+        if let Ok((_, config)) = load_config() {
+            let clean_target = clean_path(&canonical_target);
+            for (_, registered_path_str) in &config.projects {
+                if let Ok(reg_path_buf) = PathBuf::from(registered_path_str).canonicalize() {
+                    let clean_reg_path = clean_path(&reg_path_buf);
+                    if clean_target == clean_reg_path || clean_target.starts_with(&format!("{}\\", clean_reg_path)) || clean_target.starts_with(&format!("{}/", clean_reg_path)) {
+                        path_is_registered = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if !path_is_registered {
+            eprintln!("[ERROR] Ruta no autorizada o no registrada en ozymem.toml: {}", canonical_target.display());
+            return Err(anyhow::anyhow!("El directorio de ejecución no pertenece a ningún proyecto registrado. Regístralo primero o usa --force."));
+        }
+    }
+
     if !force && is_critical_root(&canonical_target) {
         return Err(anyhow::anyhow!(
             "Error: No se permite indexar desde la raíz del perfil de usuario por seguridad. Muévete a la carpeta de tu proyecto."
@@ -336,6 +359,16 @@ async fn scan_directory(
 
     let mut rust_dependency_batches: Vec<RustDependencyBatch> = Vec::new();
     let ignore_patterns = load_ignore_patterns();
+    
+    // Lista negra estricta de carpetas para evitar entrar en ellas de raíz
+    const CARPETAS_EXCLUIDAS: &[&str] = &[
+        "vendor",
+        "node_modules",
+        "target",
+        ".git",
+        "storage",
+    ];
+
     let should_descend_fn = |entry: &DirEntry| {
         let path = entry.path();
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
@@ -345,13 +378,17 @@ async fn scan_directory(
         let name_lower = name.to_lowercase();
         let path_str_lower = path.to_string_lossy().to_lowercase();
 
+        // Carpetas excluidas estrictas (evita lectura/recorrido)
+        if CARPETAS_EXCLUIDAS.iter().any(|&excl| name_lower == excl) {
+            return false;
+        }
+
         // Carpetas de Sistema
         if name_lower == "appdata"
             || name_lower == "program files"
             || name_lower == "programdata"
             || name_lower == "system32"
             || name_lower == "windows"
-            || name_lower == ".git"
             || name_lower == ".svn"
         {
             return false;
