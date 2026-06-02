@@ -62,6 +62,11 @@ enum Commands {
         #[arg(default_value = ".")]
         path: String,
     },
+    Start {
+        path: Option<String>,
+    },
+    Stop,
+    Logs,
 }
 
 struct AppContext {
@@ -91,6 +96,20 @@ struct StatusMetricsJson {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+
+    match &args.command {
+        Commands::Start { path } => {
+            return run_start(path.clone());
+        }
+        Commands::Stop => {
+            return run_stop();
+        }
+        Commands::Logs => {
+            return run_logs_tail().await;
+        }
+        _ => {}
+    }
+
     let connection = build_connection().await?;
     let display_uri = display_memgraph_uri();
     let context = AppContext {
@@ -132,6 +151,9 @@ async fn main() -> anyhow::Result<()> {
                 println!("[Core] Estructura física del grafo purgada. Conservando base de conocimientos a largo plazo.");
             }
         }
+        Commands::Start { .. } => unreachable!(),
+        Commands::Stop => unreachable!(),
+        Commands::Logs => unreachable!(),
     }
 
     Ok(())
@@ -1074,6 +1096,92 @@ fn get_language_from_path(path: &Path) -> SupportedLanguage {
 struct RustDependencyBatch {
     origin_path: String,
     hints: Vec<ParsedDependencyHint>,
+}
+
+fn run_start(path_arg: Option<String>) -> anyhow::Result<()> {
+    if std::path::Path::new(".ozymem.pid").exists() {
+        println!("[INFO] El watcher ya se encuentra activo o el archivo .ozymem.pid ya existe.");
+        return Ok(());
+    }
+
+    let target_path = path_arg.unwrap_or_else(|| ".".to_string());
+    let exe_path = std::env::current_exe()?;
+    let mut cmd = std::process::Command::new(exe_path);
+    cmd.arg("watch").arg(&target_path);
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
+
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(".ozymem.log")?;
+    let stdout_file = log_file.try_clone()?;
+    let stderr_file = log_file.try_clone()?;
+    cmd.stdout(stdout_file);
+    cmd.stderr(stderr_file);
+
+    let child = cmd.spawn()?;
+    let pid = child.id();
+    std::fs::write(".ozymem.pid", pid.to_string())?;
+    println!("[SUCCESS] Watcher iniciado en segundo plano de forma exitosa (PID: {}).", pid);
+    Ok(())
+}
+
+fn run_stop() -> anyhow::Result<()> {
+    if !std::path::Path::new(".ozymem.pid").exists() {
+        println!("[ERROR] No se encontró ningún proceso activo (.ozymem.pid ausente).");
+        return Ok(());
+    }
+
+    let pid_str = std::fs::read_to_string(".ozymem.pid")?.trim().to_string();
+    let _ = std::process::Command::new("taskkill")
+        .args(&["/PID", &pid_str, "/F"])
+        .status()?;
+
+    let _ = std::fs::remove_file(".ozymem.pid");
+    println!("[SUCCESS] Proceso del watcher (PID: {}) detenido y limpiado.", pid_str);
+    Ok(())
+}
+
+async fn run_logs_tail() -> anyhow::Result<()> {
+    let path = ".ozymem.log";
+    if !std::path::Path::new(path).exists() {
+        println!("[INFO] No hay registros de logs disponibles todavía.");
+        return Ok(());
+    }
+
+    let mut file = std::fs::File::open(path)?;
+    use std::io::{Read, Seek, SeekFrom};
+    let mut buffer = Vec::new();
+    file.read_to_end(&mut buffer)?;
+    if !buffer.is_empty() {
+        print!("{}", String::from_utf8_lossy(&buffer));
+    }
+
+    let mut pos = file.metadata()?.len();
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+        if let Ok(metadata) = std::fs::metadata(path) {
+            let new_len = metadata.len();
+            if new_len > pos {
+                if let Ok(mut f) = std::fs::File::open(path) {
+                    if f.seek(SeekFrom::Start(pos)).is_ok() {
+                        let mut new_bytes = Vec::new();
+                        if f.read_to_end(&mut new_bytes).is_ok() {
+                            print!("{}", String::from_utf8_lossy(&new_bytes));
+                            use std::io::Write;
+                            let _ = std::io::stdout().flush();
+                        }
+                    }
+                }
+                pos = new_len;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
