@@ -1445,7 +1445,9 @@ fn is_garbage_file(path: &Path) -> bool {
 }
 
 fn run_start(path_arg: Option<String>, force: bool) -> anyhow::Result<()> {
-    if std::path::Path::new(".ozymem.pid").exists() {
+    let home_dir = home::home_dir().unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    let pid_file = home_dir.join(".ozymem.pid");
+    if pid_file.exists() {
         println!("[INFO] El watcher ya se encuentra activo o el archivo .ozymem.pid ya existe.");
         return Ok(());
     }
@@ -1475,10 +1477,11 @@ fn run_start(path_arg: Option<String>, force: bool) -> anyhow::Result<()> {
         cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
     }
 
+    let log_path = home_dir.join(".ozymem.log");
     let log_file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(".ozymem.log")?;
+        .open(&log_path)?;
     let stdout_file = log_file.try_clone()?;
     let stderr_file = log_file.try_clone()?;
     cmd.stdout(stdout_file);
@@ -1486,7 +1489,7 @@ fn run_start(path_arg: Option<String>, force: bool) -> anyhow::Result<()> {
 
     let child = cmd.spawn()?;
     let pid = child.id();
-    std::fs::write(".ozymem.pid", pid.to_string())?;
+    std::fs::write(&pid_file, pid.to_string())?;
     println!("[SUCCESS] Watcher iniciado en segundo plano de forma exitosa (PID: {}).", pid);
     Ok(())
 }
@@ -1559,29 +1562,32 @@ fn run_list() -> anyhow::Result<()> {
 }
 
 fn run_stop() -> anyhow::Result<()> {
-    if !std::path::Path::new(".ozymem.pid").exists() {
+    let home_dir = home::home_dir().unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    let pid_file = home_dir.join(".ozymem.pid");
+    if !pid_file.exists() {
         println!("[ERROR] No se encontró ningún proceso activo (.ozymem.pid ausente).");
         return Ok(());
     }
 
-    let pid_str = std::fs::read_to_string(".ozymem.pid")?.trim().to_string();
+    let pid_str = std::fs::read_to_string(&pid_file)?.trim().to_string();
     let _ = std::process::Command::new("taskkill")
         .args(&["/PID", &pid_str, "/F"])
         .status()?;
 
-    let _ = std::fs::remove_file(".ozymem.pid");
+    let _ = std::fs::remove_file(&pid_file);
     println!("[SUCCESS] Proceso del watcher (PID: {}) detenido y limpiado.", pid_str);
     Ok(())
 }
 
 async fn run_logs_tail() -> anyhow::Result<()> {
-    let path = ".ozymem.log";
-    if !std::path::Path::new(path).exists() {
+    let home_dir = home::home_dir().unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    let path = home_dir.join(".ozymem.log");
+    if !path.exists() {
         println!("[INFO] No hay registros de logs disponibles todavía.");
         return Ok(());
     }
 
-    let mut file = std::fs::File::open(path)?;
+    let mut file = std::fs::File::open(&path)?;
     use std::io::{Read, Seek, SeekFrom};
     let mut buffer = Vec::new();
     file.read_to_end(&mut buffer)?;
@@ -1592,10 +1598,10 @@ async fn run_logs_tail() -> anyhow::Result<()> {
     let mut pos = file.metadata()?.len();
     loop {
         tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
-        if let Ok(metadata) = std::fs::metadata(path) {
+        if let Ok(metadata) = std::fs::metadata(&path) {
             let new_len = metadata.len();
             if new_len > pos {
-                if let Ok(mut f) = std::fs::File::open(path) {
+                if let Ok(mut f) = std::fs::File::open(&path) {
                     if f.seek(SeekFrom::Start(pos)).is_ok() {
                         let mut new_bytes = Vec::new();
                         if f.read_to_end(&mut new_bytes).is_ok() {
