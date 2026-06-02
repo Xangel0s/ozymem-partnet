@@ -688,8 +688,41 @@ async fn run_watch(context: &AppContext, target_path: &str) -> anyhow::Result<()
     for res in rx {
         match res {
             Ok(event) => {
+                let mut ignore_changed = false;
+                for path in &event.paths {
+                    if let Some(filename) = path.file_name().and_then(|f| f.to_str()) {
+                        if filename == ".ozymemignore" {
+                            ignore_changed = true;
+                            break;
+                        }
+                    }
+                }
+
+                if ignore_changed {
+                    println!("[Watcher] Detectado cambio en .ozymemignore. Sincronizando y purgando archivos ignorados del grafo...");
+                    let ignore_patterns = load_ignore_patterns();
+                    match context.connection.get_all_file_paths().await {
+                        Ok(all_paths) => {
+                            for file_path_str in all_paths {
+                                let path_obj = Path::new(&file_path_str);
+                                if is_ignored_by_patterns(path_obj, &ignore_patterns) {
+                                    let _ = context.connection.delete_file_definition(&file_path_str).await;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Error al recuperar paths del grafo para purga: {:?}", e);
+                        }
+                    }
+                }
+
                 if event.kind.is_modify() || event.kind.is_create() {
                     for path in event.paths {
+                        if let Some(filename) = path.file_name().and_then(|f| f.to_str()) {
+                            if filename == ".ozymemignore" {
+                                continue;
+                            }
+                        }
                         if should_watch_path(&path) {
                             println!("[Watcher] Detectado cambio en: {}. Actualizando grafo...", path.display());
                             if let Err(e) = index_single_file(&context.connection, &path).await {
@@ -699,6 +732,11 @@ async fn run_watch(context: &AppContext, target_path: &str) -> anyhow::Result<()
                     }
                 } else if event.kind.is_remove() {
                     for path in event.paths {
+                        if let Some(filename) = path.file_name().and_then(|f| f.to_str()) {
+                            if filename == ".ozymemignore" {
+                                continue;
+                            }
+                        }
                         if should_process_delete(&path) {
                             let resolved = canonicalize_deleted_path(&path).unwrap_or_else(|| path.clone());
                             let absolute_file_path = clean_path(&resolved);
