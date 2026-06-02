@@ -1,0 +1,16 @@
+[package]
+name = "ozymem-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap = { version = "4.4", features = ["derive"] }
+serde.workspace = true
+serde_json = "1"
+ozymem-core = { path = "../ozymem-core" }
+ozymem-parser = { path = "../ozymem-parser" }
+tokio.workspace = true
+walkdir = "2.4"
