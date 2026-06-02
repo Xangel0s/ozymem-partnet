@@ -39,6 +39,9 @@ enum Commands {
 
         #[arg(long)]
         reset: bool,
+
+        #[arg(long)]
+        force: bool,
     },
     Lessons {
         #[arg(short, long, default_value_t = 10)]
@@ -61,9 +64,15 @@ enum Commands {
     Watch {
         #[arg(default_value = ".")]
         path: String,
+
+        #[arg(long)]
+        force: bool,
     },
     Start {
         path: Option<String>,
+
+        #[arg(long)]
+        force: bool,
     },
     Stop,
     Logs,
@@ -98,8 +107,8 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     match &args.command {
-        Commands::Start { path } => {
-            return run_start(path.clone());
+        Commands::Start { path, force } => {
+            return run_start(path.clone(), *force);
         }
         Commands::Stop => {
             return run_stop();
@@ -119,14 +128,14 @@ async fn main() -> anyhow::Result<()> {
 
     match args.command {
         Commands::Status { json } => print_status(&context, json).await?,
-        Commands::Scan { path, reset } => scan_directory(&context.connection, &path, reset).await?,
+        Commands::Scan { path, reset, force } => scan_directory(&context.connection, &path, reset, force).await?,
         Commands::Lessons { limit, file } => print_lessons(&context.connection, limit, file).await?,
         Commands::Tree { file_path, depth } => {
             print_tree(&context.connection, &file_path, depth).await?
         }
         Commands::Update => run_update().await?,
         Commands::Ignore => run_ignore().await?,
-        Commands::Watch { path } => run_watch(&context, &path).await?,
+        Commands::Watch { path, force } => run_watch(&context, &path, force).await?,
         Commands::Clean { path } => {
             if let Some(file_path) = path {
                 let absolute_path = if file_path.is_absolute() {
@@ -224,8 +233,14 @@ async fn scan_directory(
     connection: &MemgraphConnection,
     target_path: &str,
     reset: bool,
+    force: bool,
 ) -> anyhow::Result<()> {
     let canonical_target = canonicalize_target(target_path)?;
+    if !force && is_critical_root(&canonical_target) {
+        return Err(anyhow::anyhow!(
+            "Error: No se permite indexar desde la raíz del perfil de usuario por seguridad. Muévete a la carpeta de tu proyecto."
+        ));
+    }
     if reset {
         connection.clear_graph().await?;
         println!("[Core] Estructura física del grafo purgada. Conservando base de conocimientos a largo plazo.");
@@ -241,7 +256,58 @@ async fn scan_directory(
             return true;
         };
 
-        if name == ".git" || name == "node_modules" || name == "target" || name.starts_with('.') {
+        let name_lower = name.to_lowercase();
+        let path_str_lower = path.to_string_lossy().to_lowercase();
+
+        // Carpetas de Sistema
+        if name_lower == "appdata"
+            || name_lower == "program files"
+            || name_lower == "programdata"
+            || name_lower == "system32"
+            || name_lower == "windows"
+            || name_lower == ".git"
+            || name_lower == ".svn"
+        {
+            return false;
+        }
+
+        // Entornos de Desarrollo
+        if name_lower == "node_modules"
+            || name_lower == "__pycache__"
+            || name_lower == ".venv"
+            || name_lower == "env"
+            || name_lower == "target"
+            || name_lower == "dist"
+            || name_lower == "build"
+        {
+            return false;
+        }
+
+        // Navegadores y WebViews
+        if name_lower == "ebwebview"
+            || name_lower == "bravesoftware"
+            || path_str_lower.contains("google/chrome")
+            || path_str_lower.contains("google\\chrome")
+            || path_str_lower.contains("microsoft/edge")
+            || path_str_lower.contains("microsoft\\edge")
+            || name_lower == "cache"
+            || name_lower == "local storage"
+        {
+            return false;
+        }
+
+        // Herramientas de IA y Editores
+        if name_lower == ".cursor"
+            || name_lower == ".vscode"
+            || name_lower == ".idea"
+            || name_lower == ".config"
+            || name_lower == ".anthropic"
+            || name_lower == ".ollama"
+        {
+            return false;
+        }
+
+        if name.starts_with('.') && name != "." {
             return false;
         }
 
@@ -264,6 +330,10 @@ async fn scan_directory(
         }
 
         if is_ignored_by_patterns(path, &ignore_patterns) {
+            continue;
+        }
+
+        if is_garbage_file(path) {
             continue;
         }
 
@@ -681,7 +751,13 @@ async fn run_update() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run_watch(context: &AppContext, target_path: &str) -> anyhow::Result<()> {
+async fn run_watch(context: &AppContext, target_path: &str, force: bool) -> anyhow::Result<()> {
+    let canonical_target = canonicalize_target(target_path)?;
+    if !force && is_critical_root(&canonical_target) {
+        return Err(anyhow::anyhow!(
+            "Error: No se permite indexar desde la raíz del perfil de usuario por seguridad. Muévete a la carpeta de tu proyecto."
+        ));
+    }
     // 1. Healthcheck rápido intentando conectar con Memgraph
     if let Err(e) = context.connection.ping().await {
         eprintln!("Error: No se pudo conectar a Memgraph (bolt://127.0.0.1:7687). Detalle: {e}");
@@ -690,7 +766,7 @@ async fn run_watch(context: &AppContext, target_path: &str) -> anyhow::Result<()
 
     // 2. Escaneo inicial de consistencia
     println!("Iniciando escaneo rápido de consistencia...");
-    if let Err(e) = scan_directory(&context.connection, target_path, false).await {
+    if let Err(e) = scan_directory(&context.connection, target_path, false, force).await {
         eprintln!("Advertencia en escaneo inicial: {e}");
     }
 
@@ -917,9 +993,63 @@ fn should_process_delete(path: &Path) -> bool {
     if is_binary_file(path) {
         return false;
     }
+    if is_garbage_file(path) {
+        return false;
+    }
+    let path_str_lower = path.to_string_lossy().to_lowercase();
     for component in path.components() {
         if let Some(name) = component.as_os_str().to_str() {
-            if name == "target" || name == ".git" || name == "node_modules" || (name.starts_with('.') && name != ".") {
+            let name_lower = name.to_lowercase();
+
+            // Carpetas de Sistema
+            if name_lower == "appdata"
+                || name_lower == "program files"
+                || name_lower == "programdata"
+                || name_lower == "system32"
+                || name_lower == "windows"
+                || name_lower == ".git"
+                || name_lower == ".svn"
+            {
+                return false;
+            }
+
+            // Entornos de Desarrollo
+            if name_lower == "node_modules"
+                || name_lower == "__pycache__"
+                || name_lower == ".venv"
+                || name_lower == "env"
+                || name_lower == "target"
+                || name_lower == "dist"
+                || name_lower == "build"
+            {
+                return false;
+            }
+
+            // Navegadores y WebViews
+            if name_lower == "ebwebview"
+                || name_lower == "bravesoftware"
+                || path_str_lower.contains("google/chrome")
+                || path_str_lower.contains("google\\chrome")
+                || path_str_lower.contains("microsoft/edge")
+                || path_str_lower.contains("microsoft\\edge")
+                || name_lower == "cache"
+                || name_lower == "local storage"
+            {
+                return false;
+            }
+
+            // Herramientas de IA y Editores
+            if name_lower == ".cursor"
+                || name_lower == ".vscode"
+                || name_lower == ".idea"
+                || name_lower == ".config"
+                || name_lower == ".anthropic"
+                || name_lower == ".ollama"
+            {
+                return false;
+            }
+
+            if name.starts_with('.') && name != "." {
                 return false;
             }
         }
@@ -938,9 +1068,63 @@ fn should_watch_path(path: &Path) -> bool {
     if is_binary_file(path) {
         return false;
     }
+    if is_garbage_file(path) {
+        return false;
+    }
+    let path_str_lower = path.to_string_lossy().to_lowercase();
     for component in path.components() {
         if let Some(name) = component.as_os_str().to_str() {
-            if name == "target" || name == ".git" || name == "node_modules" || (name.starts_with('.') && name != ".") {
+            let name_lower = name.to_lowercase();
+
+            // Carpetas de Sistema
+            if name_lower == "appdata"
+                || name_lower == "program files"
+                || name_lower == "programdata"
+                || name_lower == "system32"
+                || name_lower == "windows"
+                || name_lower == ".git"
+                || name_lower == ".svn"
+            {
+                return false;
+            }
+
+            // Entornos de Desarrollo
+            if name_lower == "node_modules"
+                || name_lower == "__pycache__"
+                || name_lower == ".venv"
+                || name_lower == "env"
+                || name_lower == "target"
+                || name_lower == "dist"
+                || name_lower == "build"
+            {
+                return false;
+            }
+
+            // Navegadores y WebViews
+            if name_lower == "ebwebview"
+                || name_lower == "bravesoftware"
+                || path_str_lower.contains("google/chrome")
+                || path_str_lower.contains("google\\chrome")
+                || path_str_lower.contains("microsoft/edge")
+                || path_str_lower.contains("microsoft\\edge")
+                || name_lower == "cache"
+                || name_lower == "local storage"
+            {
+                return false;
+            }
+
+            // Herramientas de IA y Editores
+            if name_lower == ".cursor"
+                || name_lower == ".vscode"
+                || name_lower == ".idea"
+                || name_lower == ".config"
+                || name_lower == ".anthropic"
+                || name_lower == ".ollama"
+            {
+                return false;
+            }
+
+            if name.starts_with('.') && name != "." {
                 return false;
             }
         }
@@ -1098,16 +1282,63 @@ struct RustDependencyBatch {
     hints: Vec<ParsedDependencyHint>,
 }
 
-fn run_start(path_arg: Option<String>) -> anyhow::Result<()> {
+fn is_critical_root(path: &Path) -> bool {
+    let mut components = path.components();
+    let _first = components.next();
+    let second = components.next();
+    if second.is_none() || (second.is_some() && components.next().is_none() && matches!(second.unwrap(), std::path::Component::RootDir)) {
+        return true;
+    }
+    let path_str = path.to_string_lossy().to_lowercase();
+    let path_cleaned = path_str.trim_end_matches('\\').trim_end_matches('/');
+    if path_cleaned == "c:\\users" || path_cleaned == "c:/users" {
+        return true;
+    }
+    if let Ok(user_profile) = std::env::var("USERPROFILE") {
+        if path_cleaned == user_profile.to_lowercase().trim_end_matches('\\').trim_end_matches('/') {
+            return true;
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        if path_cleaned == home.to_lowercase().trim_end_matches('\\').trim_end_matches('/') {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_garbage_file(path: &Path) -> bool {
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        let ext_lower = ext.to_lowercase();
+        match ext_lower.as_str() {
+            "log" | "history" | "bin" | "dat" | "cache" | "exe" | "dll" | "so" | "dylib" | "db" | "sqlite" | "sqlite3" | "pstat" | "lock" | "pid" => true,
+            _ => false,
+        }
+    } else {
+        false
+    }
+}
+
+fn run_start(path_arg: Option<String>, force: bool) -> anyhow::Result<()> {
     if std::path::Path::new(".ozymem.pid").exists() {
         println!("[INFO] El watcher ya se encuentra activo o el archivo .ozymem.pid ya existe.");
         return Ok(());
     }
 
     let target_path = path_arg.unwrap_or_else(|| ".".to_string());
+    let canonical = canonicalize_target(&target_path)?;
+    if !force && is_critical_root(&canonical) {
+        let err_msg = "Error: No se permite indexar desde la raíz del perfil de usuario por seguridad. Muévete a la carpeta de tu proyecto.";
+        println!("{}", err_msg);
+        return Err(anyhow::anyhow!(err_msg));
+    }
+
     let exe_path = std::env::current_exe()?;
     let mut cmd = std::process::Command::new(exe_path);
     cmd.arg("watch").arg(&target_path);
+    if force {
+        cmd.arg("--force");
+    }
 
     #[cfg(windows)]
     {
