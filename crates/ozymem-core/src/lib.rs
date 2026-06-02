@@ -11,6 +11,7 @@ pub struct MemgraphConfig {
     pub database: String,
 }
 
+#[derive(Clone)]
 pub struct MemgraphConnection {
     graph: Graph,
 }
@@ -50,6 +51,19 @@ pub struct LessonRecord {
     pub error_type: String,
     pub solution: String,
     pub timestamp: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum WalAction {
+    Upsert,
+    Delete,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WalEntry {
+    pub timestamp: u64,
+    pub action: WalAction,
+    pub file_path: String,
 }
 
 impl MemgraphConnection {
