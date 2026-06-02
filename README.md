@@ -1,80 +1,71 @@
 # Ozymem
 
-Monorepo Rust para el motor de análisis y el servidor MCP de Ozymem.
+Ozymem es un motor de análisis arquitectónico políglota y un servidor de engramas de memoria basado en grafos de conocimiento. Utiliza Memgraph como base de datos para almacenar y correlacionar relaciones de dependencia, estructuras de funciones, y lecciones aprendidas durante los procesos de desarrollo y refactorización.
 
-## Estructura inicial
+## Requisitos previos
 
-- `crates/ozymem-core`: acceso a Memgraph y utilidades del dominio
-- `crates/ozymem-parser`: extracción sintáctica semántica
-- `crates/ozymem-cli`: indexación local desde terminal
-- `crates/ozymem-server`: servidor MCP local
+Para poder ejecutar e instalar Ozymem localmente se requiere contar con:
 
-## Arranque local
+- Rust (cargo, rustc versión estable reciente)
+- Docker y Docker Desktop (con soporte para `docker compose`)
 
-1. Levanta Memgraph y Memgraph Lab:
+## Instalación rápida (Windows)
 
-```bash
-docker compose up -d
+En la raíz del monorepo, abre PowerShell y ejecuta el script de inicialización:
+
+```powershell
+Set-ExecutionPolicy Bypass -Scope Process -Force
+.\init-ozymem.ps1
 ```
 
-2. Prueba la conexión básica desde `ozymem-core`:
+Este script automatizará las siguientes tareas:
+1. Comprobar que Docker y Cargo estén disponibles y que Docker Desktop esté en ejecución.
+2. Iniciar el contenedor de Memgraph (junto con Memgraph Lab) si no están activos.
+3. Compilar e instalar la herramienta `ozymem` globalmente en el sistema.
+4. Indexar el propio monorepo por primera vez.
+5. Imprimir el estado actual del sistema Ozymem.
 
+## Uso de la CLI
+
+Una vez instalado, tienes a tu disposición el comando global `ozymem`. A continuación se detallan los subcomandos principales:
+
+### Ver estado
+Para comprobar la conectividad con la base de datos de grafos y las métricas básicas de entidades indexadas:
 ```bash
-cargo run -p ozymem-core --bin ping-memgraph
+ozymem status
 ```
 
-3. Ajusta `MEMGRAPH_URI`, `MEMGRAPH_USER`, `MEMGRAPH_PASSWORD` y `MEMGRAPH_DATABASE` si cambias la configuración por defecto.
-
-
-## CLI
-
-Escanear un directorio con el recolector:
-
+### Indexar código
+Para indexar de forma recursiva un directorio y registrar sus archivos, funciones y dependencias internas:
 ```bash
-cargo run -p ozymem-cli -- scan --dir .
+ozymem scan <directorio>
+```
+Si deseas vaciar el grafo por completo antes del análisis, puedes agregar la bandera `--reset`:
+```bash
+ozymem scan <directorio> --reset
 ```
 
-Para vaciar el grafo antes de reindexar:
-
+### Consultar lecciones históricas
+Para visualizar las lecciones guardadas a partir de errores y soluciones registrados en el sistema:
 ```bash
-cargo run -p ozymem-cli -- scan --dir . --reset
+ozymem lessons --limit 10
 ```
 
-La CLI indexa archivos `.py`, `.go`, `.js`, `.ts`, `.tsx`, `.jsx` y `.sql`, y degrada el resto a `Unknown` con fallback textual sin ignorarlos.
+### Visualizar el árbol de dependencias
+Para representar la jerarquía y las funciones asociadas de un archivo específico de manera visual en forma de árbol:
+```bash
+ozymem tree <ruta_al_archivo> --depth 2
+```
 
-## MCP Server
+## Servidor MCP
 
-Levantar el servidor MCP local:
+Para iniciar el servidor del Protocolo de Contexto de Modelos (MCP) y permitir la comunicación directa con IDEs (como Cursor o Claude Desktop):
 
 ```bash
 cargo run -p ozymem-server
 ```
 
-El servidor expone dos tools de lectura por stdio:
-
-- `file_context`: devuelve el lenguaje, la estrategia y las funciones indexadas de un archivo.
-- `graph_summary`: devuelve un resumen global del grafo indexado.
-
-### Wrapper de arranque para Windows
-
-Si vas a conectarlo desde Cursor o Claude Desktop, usa el wrapper `start-ozymem.ps1` para:
-
-1. levantar Memgraph con Docker,
-2. esperar a que el puerto `7687` esté disponible,
-3. ejecutar el servidor MCP ya compilado.
-
-Ejemplo de configuración:
-
-```json
-{
-  "command": "powershell.exe",
-  "args": [
-    "-NoLogo",
-    "-NoProfile",
-    "-ExecutionPolicy",
-    "Bypass",
-    "-File",
-    "C:\\Users\\Lenovo\\Documents\\ozymem\\start-ozymem.ps1"
-  ]
-}
+Alternativamente, en entornos Windows, se puede usar el wrapper preconfigurado:
+```powershell
+.\start-ozymem.ps1
 ```
