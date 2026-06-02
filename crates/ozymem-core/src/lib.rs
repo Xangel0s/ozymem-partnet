@@ -153,13 +153,27 @@ impl MemgraphConnection {
         Ok(())
     }
 
-    pub async fn delete_file_definition(&self, file_path: &str) -> anyhow::Result<()> {
+    pub async fn delete_file_definition(&self, file_path: &str) -> anyhow::Result<bool> {
+        let mut check_result = self
+            .graph
+            .execute(query("MATCH (f:File {path: $path}) RETURN count(f) AS file_count").param("path", file_path))
+            .await?;
+        let row = check_result
+            .next()
+            .await?
+            .context("Memgraph did not return existence count row")?;
+        let file_count: i64 = row.get("file_count")?;
+
+        if file_count == 0 {
+            return Ok(false);
+        }
+
         let delete_query = query(
             "MATCH (f:File {path: $path})\nOPTIONAL MATCH (f)-[:CONTAINS]->(fn:Function)\nDETACH DELETE f, fn",
         )
         .param("path", file_path);
         self.graph.run(delete_query).await?;
-        Ok(())
+        Ok(true)
     }
 
     pub async fn get_historical_engram_solutions(

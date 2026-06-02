@@ -110,11 +110,23 @@ async fn main() -> anyhow::Result<()> {
         Commands::Watch { path } => run_watch(&context, &path).await?,
         Commands::Clean { path } => {
             if let Some(file_path) = path {
-                let resolved_path = fs::canonicalize(&file_path)
-                    .unwrap_or_else(|_| file_path);
-                let sanitized_path = clean_path(&resolved_path);
-                context.connection.delete_file_definition(&sanitized_path).await?;
-                println!("[Core] El archivo {} y sus funciones fueron eliminados del grafo.", sanitized_path);
+                let absolute_path = if file_path.is_absolute() {
+                    file_path
+                } else {
+                    std::env::current_dir()?.join(&file_path)
+                };
+                let sanitized_path = clean_path(&absolute_path);
+                match context.connection.delete_file_definition(&sanitized_path).await {
+                    Ok(true) => {
+                        println!("[Core] El archivo {} y sus funciones fueron eliminados del grafo.", sanitized_path);
+                    }
+                    Ok(false) => {
+                        println!("[Core] El archivo {} no se encontró en el grafo. Nada que eliminar.", sanitized_path);
+                    }
+                    Err(e) => {
+                        eprintln!("[Core] Error al eliminar el archivo {}: {:?}", sanitized_path, e);
+                    }
+                }
             } else {
                 context.connection.clear_graph().await?;
                 println!("[Core] Estructura física del grafo purgada. Conservando base de conocimientos a largo plazo.");
