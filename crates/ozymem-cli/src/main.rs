@@ -54,6 +54,10 @@ enum Commands {
         depth: u32,
     },
     Update,
+    Watch {
+        #[arg(default_value = ".")]
+        path: String,
+    },
 }
 
 struct AppContext {
@@ -98,6 +102,7 @@ async fn main() -> anyhow::Result<()> {
             print_tree(&context.connection, &file_path, depth).await?
         }
         Commands::Update => run_update().await?,
+        Commands::Watch { path } => run_watch(&context, &path).await?,
     }
 
     Ok(())
@@ -598,6 +603,104 @@ async fn run_update() -> anyhow::Result<()> {
         println!("Ozymem updated successfully!");
     } else {
         println!("Ozymem is already on the latest version.");
+    }
+
+    Ok(())
+}
+
+async fn run_watch(context: &AppContext, target_path: &str) -> anyhow::Result<()> {
+    // 1. Healthcheck rápido intentando conectar con Memgraph
+    if let Err(e) = context.connection.ping().await {
+        eprintln!("Error: No se pudo conectar a Memgraph (bolt://127.0.0.1:7687). Detalle: {e}");
+        return Ok(());
+    }
+
+    // 2. Escaneo inicial de consistencia
+    println!("Iniciando escaneo rápido de consistencia...");
+    if let Err(e) = scan_directory(&context.connection, target_path, false).await {
+        eprintln!("Advertencia en escaneo inicial: {e}");
+    }
+
+    // 3. Inicializar notify
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut watcher = notify::recommended_watcher(move |res| {
+        if let Err(e) = tx.send(res) {
+            eprintln!("Watcher channel send error: {:?}", e);
+        }
+    })?;
+
+    use notify::Watcher;
+    watcher.watch(Path::new(target_path), notify::RecursiveMode::Recursive)?;
+    println!("[Watcher] Vigilando cambios reactivamente en: {}...", target_path);
+
+    // 4. Bucle reactivo de eventos
+    for res in rx {
+        match res {
+            Ok(event) => {
+                if event.kind.is_modify() || event.kind.is_create() {
+                    for path in event.paths {
+                        if should_watch_path(&path) {
+                            println!("[Watcher] Detectado cambio en: {}. Actualizando grafo...", path.display());
+                            if let Err(e) = index_single_file(&context.connection, &path).await {
+                                eprintln!("Error al indexar archivo {}: {:?}", path.display(), e);
+                            }
+                        }
+                    }
+                }
+            }
+            Err(e) => eprintln!("Watcher error: {:?}", e),
+        }
+    }
+
+    Ok(())
+}
+
+fn should_watch_path(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    if is_binary_file(path) {
+        return false;
+    }
+    for component in path.components() {
+        if let Some(name) = component.as_os_str().to_str() {
+            if name == "target" || name == ".git" || name == "node_modules" || (name.starts_with('.') && name != ".") {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+async fn index_single_file(connection: &MemgraphConnection, path: &Path) -> anyhow::Result<()> {
+    let language = get_language_from_path(path);
+    let absolute_path = fs::canonicalize(path)?;
+    let absolute_file_path = absolute_path.to_string_lossy().to_string();
+
+    let source_code = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) => {
+            if error.kind() == std::io::ErrorKind::InvalidData {
+                println!("Skipped binary/non-UTF8 file: {}", path.display());
+            } else {
+                eprintln!("Failed to read {}: {error}", path.display());
+            }
+            return Ok(());
+        }
+    };
+
+    let map = parse_source(&absolute_file_path, language, &source_code)?;
+    connection.save_file_definition(&map).await?;
+
+    if matches!(language, SupportedLanguage::Rust) {
+        if let Ok(hints) = extract_dependency_hints(&absolute_file_path, language, &source_code) {
+            let internal_hints: Vec<_> = hints.into_iter().filter(is_internal_dependency_hint).collect();
+            for hint in internal_hints {
+                if let Some(destination_path) = resolve_dependency_target(&hint, &absolute_file_path) {
+                    let _ = connection.save_dependency_relation(&absolute_file_path, &destination_path.to_string_lossy()).await;
+                }
+            }
+        }
     }
 
     Ok(())
