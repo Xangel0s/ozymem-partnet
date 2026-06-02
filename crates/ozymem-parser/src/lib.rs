@@ -652,4 +652,30 @@ use ozymem_core::MemgraphConnection;
         assert!(labels.contains("crate::domain::User"));
         assert!(labels.contains("ozymem_core::MemgraphConnection"));
     }
+
+    #[test]
+    fn identifies_binary_files() {
+        assert!(is_binary_file(std::path::Path::new("document.pdf")));
+        assert!(is_binary_file(std::path::Path::new("archive.tar.gz")));
+        assert!(is_binary_file(std::path::Path::new("image.png")));
+        assert!(!is_binary_file(std::path::Path::new("source.rs")));
+        assert!(!is_binary_file(std::path::Path::new("script.py")));
+    }
 }
+
+pub fn is_binary_file(path: &std::path::Path) -> bool {
+    let path_str = path.to_string_lossy().to_lowercase();
+    if path_str.ends_with(".tar.gz") {
+        return true;
+    }
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        let ext = ext.to_lowercase();
+        matches!(
+            ext.as_str(),
+            "pdf" | "rar" | "zip" | "jpeg" | "jpg" | "png" | "exe" | "gif" | "ico" | "bin" | "tar" | "gz" | "7z"
+        )
+    } else {
+        false
+    }
+}
+
