@@ -5,8 +5,8 @@ use ozymem_core::{
     MemgraphConfig, MemgraphConnection, StoredFunction,
 };
 use ozymem_parser::{
-    extract_dependency_hints, is_internal_dependency_hint, parse_source, resolve_dependency_target,
-    ParsedDependencyHint, SupportedLanguage,
+    extract_dependency_hints, is_binary_file, is_internal_dependency_hint, parse_source,
+    resolve_dependency_target, ParsedDependencyHint, SupportedLanguage,
 };
 use serde::Serialize;
 use std::collections::HashSet;
@@ -43,6 +43,9 @@ enum Commands {
     Lessons {
         #[arg(short, long, default_value_t = 10)]
         limit: usize,
+
+        #[arg(long)]
+        file: Option<String>,
     },
     Tree {
         file_path: String,
@@ -89,7 +92,7 @@ async fn main() -> anyhow::Result<()> {
     match args.command {
         Commands::Status { json } => print_status(&context, json).await?,
         Commands::Scan { path, reset } => scan_directory(&context.connection, &path, reset).await?,
-        Commands::Lessons { limit } => print_lessons(&context.connection, limit).await?,
+        Commands::Lessons { limit, file } => print_lessons(&context.connection, limit, file).await?,
         Commands::Tree { file_path, depth } => {
             print_tree(&context.connection, &file_path, depth).await?
         }
@@ -131,7 +134,7 @@ async fn print_status(context: &AppContext, json_output: bool) -> anyhow::Result
     if json_output {
         let payload = StatusJsonOutput {
             database: DatabaseJsonOutput {
-                status: "CONNECTED",
+                status: "ACTIVE",
                 uri: context.display_uri.clone(),
             },
             metrics: StatusMetricsJson {
@@ -145,14 +148,16 @@ async fn print_status(context: &AppContext, json_output: bool) -> anyhow::Result
         return Ok(());
     }
 
-    println!("OZYMEM SYSTEM STATUS");
-    println!("--------------------");
-    println!("Database: CONNECTED ({})", context.display_uri);
+    println!("OZYMEM CORE LOGISTICS");
+    println!("---------------------");
+    println!("Database Target: {}", context.display_uri);
+    println!("Storage Status: ACTIVE");
     println!();
-    println!("Metrics:");
-    println!("  Files Indexed: {}", summary.file_count);
-    println!("  Functions Mapped: {}", summary.function_count);
-    println!("  Engrams Formed: {}", summary.engram_count);
+    println!("Graph Topology:");
+    println!(
+        "  Files: {} | Functions: {} | Engrams: {}",
+        summary.file_count, summary.function_count, summary.engram_count
+    );
 
     Ok(())
 }
@@ -183,6 +188,11 @@ async fn scan_directory(
             continue;
         }
 
+        if is_binary_file(path) {
+            println!("Skipped binary file: {}", path.to_string_lossy());
+            continue;
+        }
+
         let language = get_language_from_path(path);
         let absolute_path = match fs::canonicalize(path) {
             Ok(canonical) => canonical,
@@ -196,7 +206,11 @@ async fn scan_directory(
         let source_code = match fs::read_to_string(path) {
             Ok(contents) => contents,
             Err(error) => {
-                eprintln!("Failed to read {}: {error}", path.display());
+                if error.kind() == std::io::ErrorKind::InvalidData {
+                    println!("Skipped binary/non-UTF8 file: {}", path.display());
+                } else {
+                    eprintln!("Failed to read {}: {error}", path.display());
+                }
                 continue;
             }
         };
@@ -265,9 +279,13 @@ async fn scan_directory(
     Ok(())
 }
 
-async fn print_lessons(connection: &MemgraphConnection, limit: usize) -> anyhow::Result<()> {
+async fn print_lessons(
+    connection: &MemgraphConnection,
+    limit: usize,
+    file_filter: Option<String>,
+) -> anyhow::Result<()> {
     let limit = i64::try_from(limit).context("limit is too large")?;
-    let lessons = connection.get_recent_lessons(limit).await?;
+    let lessons = connection.get_recent_lessons(limit, file_filter).await?;
 
     println!("HISTORICAL KNOWLEDGE BASE");
     println!("-------------------------");
@@ -374,7 +392,7 @@ fn load_tree_node<'a>(
 fn render_tree_node(node: &TreeNode, prefix: &str, is_last: bool, is_root: bool) {
     if !is_root && node.cyclic {
         let branch = if is_last { "└──" } else { "├──" };
-        println!("{}{} File: {} (already listed)", prefix, branch, node.path);
+        println!("{}{} [DEPENDS_ON] File: {} (already listed)", prefix, branch, node.path);
         return;
     }
 
@@ -382,7 +400,7 @@ fn render_tree_node(node: &TreeNode, prefix: &str, is_last: bool, is_root: bool)
         println!("File: {}", node.path);
     } else {
         let branch = if is_last { "└──" } else { "├──" };
-        println!("{}{} File: {}", prefix, branch, node.path);
+        println!("{}{} [DEPENDS_ON] File: {}", prefix, branch, node.path);
     }
 
     let next_prefix = if is_root {
@@ -422,11 +440,11 @@ fn render_tree_node(node: &TreeNode, prefix: &str, is_last: bool, is_root: bool)
                 "├──"
             };
             println!(
-                "{}{} {} [{}] lines {}-{} via {}",
+                "{}{} [MEMBER: {}] {} (lines {}-{}) via {}",
                 function_prefix,
                 branch,
+                function.kind.to_uppercase(),
                 function.name,
-                function.kind,
                 function.start_line,
                 function.end_line,
                 function.strategy
