@@ -680,6 +680,99 @@ async fn run_watch(context: &AppContext, target_path: &str) -> anyhow::Result<()
         }
     })?;
 
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let is_connected = std::sync::Arc::new(AtomicBool::new(true));
+    let reconnecting = std::sync::Arc::new(AtomicBool::new(false));
+
+    let append_to_wal = |file_path: &str, action: ozymem_core::WalAction| {
+        let entry = ozymem_core::WalEntry {
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            action,
+            file_path: file_path.to_string(),
+        };
+        if let Ok(json_str) = serde_json::to_string(&entry) {
+            use std::io::Write;
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(".ozymem_wal")
+            {
+                let _ = writeln!(file, "{}", json_str);
+            }
+        }
+    };
+
+    let trigger_reconnect = |conn: ozymem_core::MemgraphConnection,
+                             is_conn: std::sync::Arc<AtomicBool>,
+                             reconn: std::sync::Arc<AtomicBool>| {
+        if reconn.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+            is_conn.store(false, Ordering::SeqCst);
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(5));
+                loop {
+                    interval.tick().await;
+                    if conn.ping().await.is_ok() {
+                        is_conn.store(true, Ordering::SeqCst);
+                        reconn.store(false, Ordering::SeqCst);
+
+                        if let Ok(file) = std::fs::File::open(".ozymem_wal") {
+                            use std::io::{BufRead, BufReader};
+                            let reader = BufReader::new(file);
+                            let mut entries = Vec::new();
+                            for line in reader.lines() {
+                                if let Ok(line_str) = line {
+                                    if let Ok(entry) = serde_json::from_str::<ozymem_core::WalEntry>(&line_str) {
+                                        entries.push(entry);
+                                    }
+                                }
+                            }
+
+                            let mut success = true;
+                            let mut count = 0;
+                            for entry in entries {
+                                match entry.action {
+                                    ozymem_core::WalAction::Upsert => {
+                                        let path_buf = std::path::PathBuf::from(&entry.file_path);
+                                        if path_buf.exists() {
+                                            if let Err(e) = index_single_file(&conn, &path_buf).await {
+                                                eprintln!("Error al re-indexar archivo desde WAL: {:?}", e);
+                                                success = false;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    ozymem_core::WalAction::Delete => {
+                                        if let Err(e) = conn.delete_file_definition(&entry.file_path).await {
+                                            eprintln!("Error al eliminar archivo desde WAL: {:?}", e);
+                                            success = false;
+                                            break;
+                                        }
+                                    }
+                                }
+                                count += 1;
+                            }
+
+                            if success {
+                                if let Ok(f) = std::fs::OpenOptions::new().write(true).truncate(true).open(".ozymem_wal") {
+                                    let _ = f.set_len(0);
+                                }
+                                println!("[Watcher] Conexión restablecida con Memgraph. Sincronizados {} cambios pendientes desde el WAL.", count);
+                            } else {
+                                is_conn.store(false, Ordering::SeqCst);
+                                reconn.store(true, Ordering::SeqCst);
+                                continue;
+                            }
+                        }
+                        break;
+                    }
+                }
+            });
+        }
+    };
+
     use notify::Watcher;
     watcher.watch(Path::new(target_path), notify::RecursiveMode::Recursive)?;
     println!("[Watcher] Vigilando cambios reactivamente en: {}...", target_path);
@@ -701,17 +794,22 @@ async fn run_watch(context: &AppContext, target_path: &str) -> anyhow::Result<()
                 if ignore_changed {
                     println!("[Watcher] Detectado cambio en .ozymemignore. Sincronizando y purgando archivos ignorados del grafo...");
                     let ignore_patterns = load_ignore_patterns();
-                    match context.connection.get_all_file_paths().await {
-                        Ok(all_paths) => {
-                            for file_path_str in all_paths {
-                                let path_obj = Path::new(&file_path_str);
-                                if is_ignored_by_patterns(path_obj, &ignore_patterns) {
-                                    let _ = context.connection.delete_file_definition(&file_path_str).await;
+                    if is_connected.load(Ordering::SeqCst) {
+                        match context.connection.get_all_file_paths().await {
+                            Ok(all_paths) => {
+                                for file_path_str in all_paths {
+                                    let path_obj = Path::new(&file_path_str);
+                                    if is_ignored_by_patterns(path_obj, &ignore_patterns) {
+                                        if let Err(_) = context.connection.delete_file_definition(&file_path_str).await {
+                                            append_to_wal(&file_path_str, ozymem_core::WalAction::Delete);
+                                            trigger_reconnect(context.connection.clone(), std::sync::Arc::clone(&is_connected), std::sync::Arc::clone(&reconnecting));
+                                        }
+                                    }
                                 }
                             }
-                        }
-                        Err(e) => {
-                            eprintln!("Error al recuperar paths del grafo para purga: {:?}", e);
+                            Err(_) => {
+                                trigger_reconnect(context.connection.clone(), std::sync::Arc::clone(&is_connected), std::sync::Arc::clone(&reconnecting));
+                            }
                         }
                     }
                 }
@@ -719,30 +817,46 @@ async fn run_watch(context: &AppContext, target_path: &str) -> anyhow::Result<()
                 if event.kind.is_modify() || event.kind.is_create() {
                     for path in event.paths {
                         if let Some(filename) = path.file_name().and_then(|f| f.to_str()) {
-                            if filename == ".ozymemignore" {
+                            if filename == ".ozymemignore" || filename == ".ozymem_wal" {
                                 continue;
                             }
                         }
                         if should_watch_path(&path) {
-                            println!("[Watcher] Detectado cambio en: {}. Actualizando grafo...", path.display());
-                            if let Err(e) = index_single_file(&context.connection, &path).await {
-                                eprintln!("Error al indexar archivo {}: {:?}", path.display(), e);
+                            let absolute_path = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+                            let absolute_file_path = clean_path(&absolute_path);
+                            if is_connected.load(Ordering::SeqCst) {
+                                println!("[Watcher] Detectado cambio en: {}. Actualizando grafo...", path.display());
+                                if let Err(e) = index_single_file(&context.connection, &path).await {
+                                    eprintln!("Error al indexar archivo {}: {:?}", path.display(), e);
+                                    append_to_wal(&absolute_file_path, ozymem_core::WalAction::Upsert);
+                                    trigger_reconnect(context.connection.clone(), std::sync::Arc::clone(&is_connected), std::sync::Arc::clone(&reconnecting));
+                                }
+                            } else {
+                                println!("[Watcher] Sin conexión. Registrando cambio en WAL: {}", absolute_file_path);
+                                append_to_wal(&absolute_file_path, ozymem_core::WalAction::Upsert);
                             }
                         }
                     }
                 } else if event.kind.is_remove() {
                     for path in event.paths {
                         if let Some(filename) = path.file_name().and_then(|f| f.to_str()) {
-                            if filename == ".ozymemignore" {
+                            if filename == ".ozymemignore" || filename == ".ozymem_wal" {
                                 continue;
                             }
                         }
                         if should_process_delete(&path) {
                             let resolved = canonicalize_deleted_path(&path).unwrap_or_else(|| path.clone());
                             let absolute_file_path = clean_path(&resolved);
-                            println!("[Watcher] Detectada eliminación de: {}. Limpiando grafo...", absolute_file_path);
-                            if let Err(e) = context.connection.delete_file_definition(&absolute_file_path).await {
-                                eprintln!("Error al limpiar archivo {}: {:?}", absolute_file_path, e);
+                            if is_connected.load(Ordering::SeqCst) {
+                                println!("[Watcher] Detectada eliminación de: {}. Limpiando grafo...", absolute_file_path);
+                                if let Err(e) = context.connection.delete_file_definition(&absolute_file_path).await {
+                                    eprintln!("Error al limpiar archivo {}: {:?}", absolute_file_path, e);
+                                    append_to_wal(&absolute_file_path, ozymem_core::WalAction::Delete);
+                                    trigger_reconnect(context.connection.clone(), std::sync::Arc::clone(&is_connected), std::sync::Arc::clone(&reconnecting));
+                                }
+                            } else {
+                                println!("[Watcher] Sin conexión. Registrando eliminación en WAL: {}", absolute_file_path);
+                                append_to_wal(&absolute_file_path, ozymem_core::WalAction::Delete);
                             }
                         }
                     }
