@@ -176,6 +176,19 @@ impl MemgraphConnection {
         Ok(true)
     }
 
+    pub async fn get_all_file_paths(&self) -> anyhow::Result<Vec<String>> {
+        let mut result = self
+            .graph
+            .execute(query("MATCH (f:File) RETURN f.path AS path"))
+            .await?;
+        let mut paths = Vec::new();
+        while let Some(row) = result.next().await? {
+            let path: String = row.get("path")?;
+            paths.push(path);
+        }
+        Ok(paths)
+    }
+
     pub async fn get_historical_engram_solutions(
         &self,
         file_path: &str,
