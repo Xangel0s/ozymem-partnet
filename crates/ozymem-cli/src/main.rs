@@ -139,6 +139,15 @@ enum Commands {
     },
     #[command(alias = "projects")]
     List,
+    Mcp {
+        #[command(subcommand)]
+        subcommand: McpSubcommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum McpSubcommand {
+    Run,
 }
 
 struct AppContext {
@@ -165,6 +174,8 @@ struct StatusMetricsJson {
     engrams_formed: i64,
 }
 
+mod mcp;
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
@@ -184,6 +195,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::List => {
             return run_list();
+        }
+        Commands::Mcp { subcommand: McpSubcommand::Run } => {
+            return mcp::run_mcp_server().await;
         }
         _ => {}
     }
@@ -234,6 +248,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Logs => unreachable!(),
         Commands::Register { .. } => unreachable!(),
         Commands::List => unreachable!(),
+        Commands::Mcp { .. } => unreachable!(),
     }
 
     Ok(())

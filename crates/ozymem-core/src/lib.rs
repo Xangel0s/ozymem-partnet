@@ -67,6 +67,10 @@ pub struct WalEntry {
 }
 
 impl MemgraphConnection {
+    pub fn graph(&self) -> &Graph {
+        &self.graph
+    }
+
     pub async fn connect(config: MemgraphConfig) -> anyhow::Result<Self> {
         let graph_config = ConfigBuilder::new()
             .uri(config.uri.clone())
