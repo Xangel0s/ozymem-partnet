@@ -39,6 +39,9 @@ pub struct GraphSummary {
     pub native_ast_function_count: i64,
     pub extension_wasm_function_count: i64,
     pub text_heuristic_function_count: i64,
+    pub vertex_count: i64,
+    pub edge_count: i64,
+    pub memory_usage: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -175,15 +178,19 @@ impl MemgraphConnection {
         Ok(solutions)
     }
 
-    pub async fn get_recent_lessons(&self, limit: i64) -> anyhow::Result<Vec<LessonRecord>> {
-        let mut result = self
-            .graph
-            .execute(query(
-                "MATCH (f:File)-[:TRIGGERED]->(e:ErrorLog)-[:RESOLVED_BY]->(eng:Engram)\nRETURN f.path AS file_path, coalesce(e.type, '') AS error_type, coalesce(eng.solution, '') AS solution, coalesce(eng.timestamp, '') AS timestamp\nORDER BY toInteger(eng.timestamp) DESC\nLIMIT $limit",
-            )
-            .param("limit", limit))
-            .await?;
+    pub async fn get_recent_lessons(&self, limit: i64, file_filter: Option<String>) -> anyhow::Result<Vec<LessonRecord>> {
+        let query_str = if file_filter.is_some() {
+            "MATCH (f:File)-[:TRIGGERED]->(e:ErrorLog)-[:RESOLVED_BY]->(eng:Engram)\nWHERE f.path CONTAINS $file_filter\nRETURN f.path AS file_path, coalesce(e.type, '') AS error_type, coalesce(eng.solution, '') AS solution, coalesce(eng.timestamp, '') AS timestamp\nORDER BY toInteger(eng.timestamp) DESC\nLIMIT $limit"
+        } else {
+            "MATCH (f:File)-[:TRIGGERED]->(e:ErrorLog)-[:RESOLVED_BY]->(eng:Engram)\nRETURN f.path AS file_path, coalesce(e.type, '') AS error_type, coalesce(eng.solution, '') AS solution, coalesce(eng.timestamp, '') AS timestamp\nORDER BY toInteger(eng.timestamp) DESC\nLIMIT $limit"
+        };
 
+        let mut q = query(query_str).param("limit", limit);
+        if let Some(ref filter) = file_filter {
+            q = q.param("file_filter", filter.as_str());
+        }
+
+        let mut result = self.graph.execute(q).await?;
         let mut lessons = Vec::new();
         while let Some(row) = result.next().await? {
             lessons.push(LessonRecord {
@@ -324,6 +331,42 @@ impl MemgraphConnection {
             .context("Memgraph did not return an engram row")?;
         let engram_count: i64 = engram_row.get("engram_count")?;
 
+        let mut vertex_count: i64 = 0;
+        let mut edge_count: i64 = 0;
+        let mut memory_usage: String = "0B".to_string();
+        if let Ok(mut storage_result) = self.graph.execute(query("SHOW STORAGE INFO;")).await {
+            while let Some(row) = storage_result.next().await? {
+                if let Ok(info) = row.get::<String>("storage info") {
+                    match info.as_str() {
+                        "vertex_count" => {
+                            if let Ok(val) = row.get::<i64>("value") {
+                                vertex_count = val;
+                            } else if let Ok(val_str) = row.get::<String>("value") {
+                                if let Ok(parsed) = val_str.parse::<i64>() {
+                                    vertex_count = parsed;
+                                }
+                            }
+                        }
+                        "edge_count" => {
+                            if let Ok(val) = row.get::<i64>("value") {
+                                edge_count = val;
+                            } else if let Ok(val_str) = row.get::<String>("value") {
+                                if let Ok(parsed) = val_str.parse::<i64>() {
+                                    edge_count = parsed;
+                                }
+                            }
+                        }
+                        "db_storage_memory_tracked" | "memory_res" => {
+                            if let Ok(val_str) = row.get::<String>("value") {
+                                memory_usage = val_str;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
         Ok(GraphSummary {
             file_count,
             function_count,
@@ -331,6 +374,9 @@ impl MemgraphConnection {
             native_ast_function_count,
             extension_wasm_function_count,
             text_heuristic_function_count,
+            vertex_count,
+            edge_count,
+            memory_usage,
         })
     }
 }

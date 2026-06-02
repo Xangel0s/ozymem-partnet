@@ -400,6 +400,9 @@ mod tests {
             native_ast_function_count: 3,
             extension_wasm_function_count: 1,
             text_heuristic_function_count: 1,
+            vertex_count: 0,
+            edge_count: 0,
+            memory_usage: "".to_string(),
         };
 
         let text = format_graph_summary(&summary);
