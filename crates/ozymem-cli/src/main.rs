@@ -53,6 +53,7 @@ enum Commands {
         #[arg(long, default_value_t = 2)]
         depth: u32,
     },
+    Update,
 }
 
 struct AppContext {
@@ -96,6 +97,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Tree { file_path, depth } => {
             print_tree(&context.connection, &file_path, depth).await?
         }
+        Commands::Update => run_update().await?,
     }
 
     Ok(())
@@ -483,6 +485,88 @@ fn render_tree_node(node: &TreeNode, prefix: &str, is_last: bool, is_root: bool)
 fn canonicalize_target(target_path: &str) -> anyhow::Result<PathBuf> {
     let path = Path::new(target_path);
     fs::canonicalize(path).with_context(|| format!("failed to resolve path: {target_path}"))
+}
+
+async fn run_update() -> anyhow::Result<()> {
+    // 1. Silently execute git fetch origin
+    let fetch_status = std::process::Command::new("git")
+        .args(&["fetch", "origin"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+
+    let fetch_success = match fetch_status {
+        Ok(status) => status.success(),
+        Err(_) => false,
+    };
+
+    if !fetch_success {
+        anyhow::bail!("Failed to execute 'git fetch origin'. Please make sure git is installed and you are in a git repository.");
+    }
+
+    // 2. Get current branch name
+    let branch_output = std::process::Command::new("git")
+        .args(&["rev-parse", "--abbrev-ref", "HEAD"])
+        .output()?;
+    if !branch_output.status.success() {
+        anyhow::bail!("Failed to determine current git branch.");
+    }
+    let branch = String::from_utf8_lossy(&branch_output.stdout).trim().to_string();
+
+    // 3. Compare local and remote hashes
+    let local_output = std::process::Command::new("git")
+        .args(&["rev-parse", "HEAD"])
+        .output()?;
+    let local_hash = String::from_utf8_lossy(&local_output.stdout).trim().to_string();
+
+    let remote_ref = format!("origin/{}", branch);
+    let remote_output = std::process::Command::new("git")
+        .args(&["rev-parse", &remote_ref])
+        .output()?;
+
+    if !remote_output.status.success() {
+        println!("Ozymem is already on the latest version.");
+        return Ok(());
+    }
+    let remote_hash = String::from_utf8_lossy(&remote_output.stdout).trim().to_string();
+
+    // Check if HEAD is ancestor of remote (local is behind)
+    let is_behind = if local_hash != remote_hash {
+        let ancestor_status = std::process::Command::new("git")
+            .args(&["merge-base", "--is-ancestor", "HEAD", &remote_ref])
+            .status();
+        match ancestor_status {
+            Ok(status) => status.success(),
+            Err(_) => false,
+        }
+    } else {
+        false
+    };
+
+    if is_behind {
+        println!("A new version of Ozymem is available. Updating...");
+        
+        let pull_status = std::process::Command::new("git")
+            .arg("pull")
+            .status()?;
+        if !pull_status.success() {
+            anyhow::bail!("Failed to execute 'git pull'.");
+        }
+
+        println!("Reinstalling ozymem-cli globally...");
+        let install_status = std::process::Command::new("cargo")
+            .args(&["install", "--path", "crates/ozymem-cli", "--force"])
+            .status()?;
+        if !install_status.success() {
+            anyhow::bail!("Failed to execute 'cargo install'.");
+        }
+
+        println!("Ozymem updated successfully!");
+    } else {
+        println!("Ozymem is already on the latest version.");
+    }
+
+    Ok(())
 }
 
 fn canonicalize_file(file_path: &str) -> anyhow::Result<PathBuf> {
