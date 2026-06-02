@@ -482,6 +482,16 @@ fn render_tree_node(node: &TreeNode, prefix: &str, is_last: bool, is_root: bool)
     }
 }
 
+fn print_update_error() {
+    println!("Error: El subcomando 'update' no puede ejecutarse en este directorio.");
+    println!("---------------------------------------------------------------------");
+    println!("Razón: Esta carpeta no es un repositorio Git válido o no cuenta con");
+    println!("       el origen remoto del ecosistema Ozymem.");
+    println!();
+    println!("Solución: Para buscar y aplicar actualizaciones del sistema, primero");
+    println!("          debes navegar a la carpeta raíz de tu monorepo local.");
+}
+
 fn canonicalize_target(target_path: &str) -> anyhow::Result<PathBuf> {
     let path = Path::new(target_path);
     fs::canonicalize(path).with_context(|| format!("failed to resolve path: {target_path}"))
@@ -501,31 +511,55 @@ async fn run_update() -> anyhow::Result<()> {
     };
 
     if !fetch_success {
-        anyhow::bail!("Failed to execute 'git fetch origin'. Please make sure git is installed and you are in a git repository.");
+        print_update_error();
+        return Ok(());
     }
 
     // 2. Get current branch name
-    let branch_output = std::process::Command::new("git")
+    let branch_output = match std::process::Command::new("git")
         .args(&["rev-parse", "--abbrev-ref", "HEAD"])
-        .output()?;
+        .output() {
+            Ok(output) => output,
+            Err(_) => {
+                print_update_error();
+                return Ok(());
+            }
+        };
     if !branch_output.status.success() {
-        anyhow::bail!("Failed to determine current git branch.");
+        print_update_error();
+        return Ok(());
     }
     let branch = String::from_utf8_lossy(&branch_output.stdout).trim().to_string();
 
     // 3. Compare local and remote hashes
-    let local_output = std::process::Command::new("git")
+    let local_output = match std::process::Command::new("git")
         .args(&["rev-parse", "HEAD"])
-        .output()?;
+        .output() {
+            Ok(output) => output,
+            Err(_) => {
+                print_update_error();
+                return Ok(());
+            }
+        };
+    if !local_output.status.success() {
+        print_update_error();
+        return Ok(());
+    }
     let local_hash = String::from_utf8_lossy(&local_output.stdout).trim().to_string();
 
     let remote_ref = format!("origin/{}", branch);
-    let remote_output = std::process::Command::new("git")
+    let remote_output = match std::process::Command::new("git")
         .args(&["rev-parse", &remote_ref])
-        .output()?;
+        .output() {
+            Ok(output) => output,
+            Err(_) => {
+                print_update_error();
+                return Ok(());
+            }
+        };
 
     if !remote_output.status.success() {
-        println!("Ozymem is already on the latest version.");
+        print_update_error();
         return Ok(());
     }
     let remote_hash = String::from_utf8_lossy(&remote_output.stdout).trim().to_string();
