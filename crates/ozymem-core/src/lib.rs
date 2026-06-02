@@ -153,6 +153,15 @@ impl MemgraphConnection {
         Ok(())
     }
 
+    pub async fn delete_file_definition(&self, file_path: &str) -> anyhow::Result<()> {
+        let delete_query = query(
+            "MATCH (f:File {path: $path})\nOPTIONAL MATCH (f)-[:CONTAINS]->(fn:Function)\nDETACH DELETE f, fn",
+        )
+        .param("path", file_path);
+        self.graph.run(delete_query).await?;
+        Ok(())
+    }
+
     pub async fn get_historical_engram_solutions(
         &self,
         file_path: &str,

@@ -208,7 +208,7 @@ async fn scan_directory(
                 continue;
             }
         };
-        let absolute_file_path = absolute_path.to_string_lossy().to_string();
+        let absolute_file_path = clean_path(&absolute_path);
 
         let source_code = match fs::read_to_string(path) {
             Ok(contents) => contents,
@@ -270,8 +270,9 @@ async fn scan_directory(
                 continue;
             };
 
+            let dest_path_cleaned = clean_path(&destination_path);
             if let Err(error) = connection
-                .save_dependency_relation(&batch.origin_path, &destination_path.to_string_lossy())
+                .save_dependency_relation(&batch.origin_path, &dest_path_cleaned)
                 .await
             {
                 eprintln!(
@@ -646,6 +647,17 @@ async fn run_watch(context: &AppContext, target_path: &str) -> anyhow::Result<()
                             }
                         }
                     }
+                } else if event.kind.is_remove() {
+                    for path in event.paths {
+                        if should_process_delete(&path) {
+                            let resolved = canonicalize_deleted_path(&path).unwrap_or_else(|| path.clone());
+                            let absolute_file_path = clean_path(&resolved);
+                            println!("[Watcher] Detectada eliminación de: {}. Limpiando grafo...", absolute_file_path);
+                            if let Err(e) = context.connection.delete_file_definition(&absolute_file_path).await {
+                                eprintln!("Error al limpiar archivo {}: {:?}", absolute_file_path, e);
+                            }
+                        }
+                    }
                 }
             }
             Err(e) => eprintln!("Watcher error: {:?}", e),
@@ -653,6 +665,36 @@ async fn run_watch(context: &AppContext, target_path: &str) -> anyhow::Result<()
     }
 
     Ok(())
+}
+
+fn clean_path(path: &Path) -> String {
+    let s = path.to_string_lossy().to_string();
+    if s.starts_with(r"\\?\") {
+        s[4..].to_string()
+    } else {
+        s
+    }
+}
+
+fn canonicalize_deleted_path(path: &Path) -> Option<PathBuf> {
+    let parent = path.parent()?;
+    let canonical_parent = fs::canonicalize(parent).ok()?;
+    let file_name = path.file_name()?;
+    Some(canonical_parent.join(file_name))
+}
+
+fn should_process_delete(path: &Path) -> bool {
+    if is_binary_file(path) {
+        return false;
+    }
+    for component in path.components() {
+        if let Some(name) = component.as_os_str().to_str() {
+            if name == "target" || name == ".git" || name == "node_modules" || (name.starts_with('.') && name != ".") {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 fn should_watch_path(path: &Path) -> bool {
@@ -675,7 +717,7 @@ fn should_watch_path(path: &Path) -> bool {
 async fn index_single_file(connection: &MemgraphConnection, path: &Path) -> anyhow::Result<()> {
     let language = get_language_from_path(path);
     let absolute_path = fs::canonicalize(path)?;
-    let absolute_file_path = absolute_path.to_string_lossy().to_string();
+    let absolute_file_path = clean_path(&absolute_path);
 
     let source_code = match fs::read_to_string(path) {
         Ok(contents) => contents,
@@ -697,7 +739,8 @@ async fn index_single_file(connection: &MemgraphConnection, path: &Path) -> anyh
             let internal_hints: Vec<_> = hints.into_iter().filter(is_internal_dependency_hint).collect();
             for hint in internal_hints {
                 if let Some(destination_path) = resolve_dependency_target(&hint, &absolute_file_path) {
-                    let _ = connection.save_dependency_relation(&absolute_file_path, &destination_path.to_string_lossy()).await;
+                    let dest_path_cleaned = clean_path(&destination_path);
+                    let _ = connection.save_dependency_relation(&absolute_file_path, &dest_path_cleaned).await;
                 }
             }
         }
