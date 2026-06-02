@@ -15,6 +15,8 @@ anyhow.workspace = true
 clap = { version = "4.4", features = ["derive"] }
 serde.workspace = true
 serde_json = "1"
+toml = "0.8"
+home = "0.5"
 ozymem-core = { path = "../ozymem-core" }
 ozymem-parser = { path = "../ozymem-parser" }
 tokio.workspace = true

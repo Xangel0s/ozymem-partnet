@@ -8,7 +8,7 @@ use ozymem_parser::{
     extract_dependency_hints, is_binary_file, is_internal_dependency_hint, parse_source,
     resolve_dependency_target, ParsedDependencyHint, SupportedLanguage,
 };
-use serde::Serialize;
+use serde::{Serialize, Deserialize};
 use std::collections::HashSet;
 use std::convert::TryFrom;
 use std::fs;
@@ -16,6 +16,64 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use walkdir::{DirEntry, WalkDir};
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BrainConfig {
+    pub host: String,
+    pub port: u16,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct OzymemConfig {
+    pub current_brain: String,
+    pub brains: std::collections::HashMap<String, BrainConfig>,
+    pub projects: std::collections::HashMap<String, String>,
+}
+
+impl Default for OzymemConfig {
+    fn default() -> Self {
+        let mut brains = std::collections::HashMap::new();
+        brains.insert(
+            "local_docker".to_string(),
+            BrainConfig {
+                host: "127.0.0.1".to_string(),
+                port: 7687,
+            },
+        );
+        Self {
+            current_brain: "local_docker".to_string(),
+            brains,
+            projects: std::collections::HashMap::new(),
+        }
+    }
+}
+
+fn load_config() -> anyhow::Result<(PathBuf, OzymemConfig)> {
+    let home_dir = home::home_dir().context("Could not find user home directory")?;
+    let config_path = home_dir.join(".ozymem.toml");
+    if !config_path.exists() {
+        let default_config = OzymemConfig::default();
+        let toml_str = toml::to_string_pretty(&default_config)?;
+        if let Some(parent) = config_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&config_path, toml_str)?;
+        Ok((config_path, default_config))
+    } else {
+        let content = fs::read_to_string(&config_path)?;
+        let config: OzymemConfig = toml::from_str(&content)?;
+        Ok((config_path, config))
+    }
+}
+
+fn save_config(path: &Path, config: &OzymemConfig) -> anyhow::Result<()> {
+    let toml_str = toml::to_string_pretty(config)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, toml_str)?;
+    Ok(())
+}
 
 #[derive(Parser)]
 #[command(
@@ -76,6 +134,11 @@ enum Commands {
     },
     Stop,
     Logs,
+    Register {
+        name: Option<String>,
+    },
+    #[command(alias = "projects")]
+    List,
 }
 
 struct AppContext {
@@ -115,6 +178,12 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Logs => {
             return run_logs_tail().await;
+        }
+        Commands::Register { name } => {
+            return run_register(name.clone());
+        }
+        Commands::List => {
+            return run_list();
         }
         _ => {}
     }
@@ -163,6 +232,8 @@ async fn main() -> anyhow::Result<()> {
         Commands::Start { .. } => unreachable!(),
         Commands::Stop => unreachable!(),
         Commands::Logs => unreachable!(),
+        Commands::Register { .. } => unreachable!(),
+        Commands::List => unreachable!(),
     }
 
     Ok(())
@@ -752,6 +823,8 @@ async fn run_update() -> anyhow::Result<()> {
 }
 
 async fn run_watch(context: &AppContext, target_path: &str, force: bool) -> anyhow::Result<()> {
+    check_directory_authorized(target_path)?;
+
     let canonical_target = canonicalize_target(target_path)?;
     if !force && is_critical_root(&canonical_target) {
         return Err(anyhow::anyhow!(
@@ -1326,6 +1399,10 @@ fn run_start(path_arg: Option<String>, force: bool) -> anyhow::Result<()> {
     }
 
     let target_path = path_arg.unwrap_or_else(|| ".".to_string());
+    
+    // Authorization Check
+    check_directory_authorized(&target_path)?;
+
     let canonical = canonicalize_target(&target_path)?;
     if !force && is_critical_root(&canonical) {
         let err_msg = "Error: No se permite indexar desde la raíz del perfil de usuario por seguridad. Muévete a la carpeta de tu proyecto.";
@@ -1359,6 +1436,73 @@ fn run_start(path_arg: Option<String>, force: bool) -> anyhow::Result<()> {
     let pid = child.id();
     std::fs::write(".ozymem.pid", pid.to_string())?;
     println!("[SUCCESS] Watcher iniciado en segundo plano de forma exitosa (PID: {}).", pid);
+    Ok(())
+}
+
+fn check_directory_authorized(target_path: &str) -> anyhow::Result<()> {
+    let canonical_target = canonicalize_target(target_path)?;
+    let clean_target = clean_path(&canonical_target);
+    
+    let (_, config) = load_config()?;
+    
+    let mut is_authorized = false;
+    for (_, registered_path_str) in &config.projects {
+        if let Ok(reg_path_buf) = PathBuf::from(registered_path_str).canonicalize() {
+            let clean_reg_path = clean_path(&reg_path_buf);
+            if clean_target == clean_reg_path {
+                is_authorized = true;
+                break;
+            }
+        }
+    }
+    
+    if !is_authorized {
+        return Err(anyhow::anyhow!(
+            "Error: Este directorio no está registrado en ozymem. Ejecuta 'ozymem register' primero para autorizarlo."
+        ));
+    }
+    
+    Ok(())
+}
+
+fn run_register(name_arg: Option<String>) -> anyhow::Result<()> {
+    let current_dir = std::env::current_dir()?;
+    let canonical_path = current_dir.canonicalize()
+        .context("Failed to canonicalize current directory path")?;
+    let cleaned_path = clean_path(&canonical_path);
+
+    let name = match name_arg {
+        Some(n) => n,
+        None => {
+            use dialoguer::Input;
+            Input::<String>::new()
+                .with_prompt("Nombre del proyecto")
+                .interact_text()?
+        }
+    };
+
+    let (config_path, mut config) = load_config()?;
+    config.projects.insert(name.clone(), cleaned_path.clone());
+    save_config(&config_path, &config)?;
+
+    println!("[SUCCESS] Proyecto '{}' registrado en {}", name, cleaned_path);
+    Ok(())
+}
+
+fn run_list() -> anyhow::Result<()> {
+    let (_, config) = load_config()?;
+    if config.projects.is_empty() {
+        println!("[INFO] No hay proyectos registrados todavía. Usa 'ozymem register' para registrar uno.");
+        return Ok(());
+    }
+
+    println!("+---------------------------+------------------------------------------------------------+");
+    println!("| Nombre del Proyecto       | Ruta Registrada                                            |");
+    println!("+---------------------------+------------------------------------------------------------+");
+    for (name, path) in &config.projects {
+        println!("| {:<25} | {:<58} |", name, path);
+    }
+    println!("+---------------------------+------------------------------------------------------------+");
     Ok(())
 }
 
