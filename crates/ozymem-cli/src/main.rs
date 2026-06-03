@@ -1753,6 +1753,8 @@ async fn run_logs_tail(project_arg: Option<String>) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    println!("[INFO] Mostrando registros en tiempo real para '{}' (Ruta: {}). Presiona Ctrl+C para salir.", project_name, path.display());
+
     let mut file = std::fs::File::open(&path)?;
     use std::io::{Read, Seek, SeekFrom};
     let mut buffer = Vec::new();
