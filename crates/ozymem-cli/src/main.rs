@@ -28,6 +28,7 @@ pub struct OzymemConfig {
     pub current_brain: String,
     pub brains: std::collections::HashMap<String, BrainConfig>,
     pub projects: std::collections::HashMap<String, String>,
+    pub token: Option<String>,
 }
 
 impl Default for OzymemConfig {
@@ -44,6 +45,7 @@ impl Default for OzymemConfig {
             current_brain: "local_docker".to_string(),
             brains,
             projects: std::collections::HashMap::new(),
+            token: None,
         }
     }
 }
@@ -427,11 +429,14 @@ async fn scan_directory(
     if !force {
         let mut path_is_registered = false;
         if let Ok((_, config)) = load_config() {
-            let clean_target = clean_path(&canonical_target);
+            let clean_target_lower = clean_path(&canonical_target).to_lowercase();
             for (_, registered_path_str) in &config.projects {
                 if let Ok(reg_path_buf) = PathBuf::from(registered_path_str).canonicalize() {
-                    let clean_reg_path = clean_path(&reg_path_buf);
-                    if clean_target == clean_reg_path || clean_target.starts_with(&format!("{}\\", clean_reg_path)) || clean_target.starts_with(&format!("{}/", clean_reg_path)) {
+                    let clean_reg_path_lower = clean_path(&reg_path_buf).to_lowercase();
+                    if clean_target_lower == clean_reg_path_lower 
+                        || clean_target_lower.starts_with(&format!("{}\\", clean_reg_path_lower)) 
+                        || clean_target_lower.starts_with(&format!("{}/", clean_reg_path_lower)) 
+                    {
                         path_is_registered = true;
                         break;
                     }
@@ -1606,14 +1611,15 @@ fn run_start(path_arg: Option<String>, force: bool) -> anyhow::Result<()> {
 fn check_directory_authorized(target_path: &str) -> anyhow::Result<()> {
     let canonical_target = canonicalize_target(target_path)?;
     let clean_target = clean_path(&canonical_target);
+    let clean_target_lower = clean_target.to_lowercase();
     
     let (_, config) = load_config()?;
     
     let mut is_authorized = false;
     for (_, registered_path_str) in &config.projects {
         if let Ok(reg_path_buf) = PathBuf::from(registered_path_str).canonicalize() {
-            let clean_reg_path = clean_path(&reg_path_buf);
-            if clean_target == clean_reg_path {
+            let clean_reg_path_lower = clean_path(&reg_path_buf).to_lowercase();
+            if clean_target_lower == clean_reg_path_lower {
                 is_authorized = true;
                 break;
             }
@@ -1878,12 +1884,13 @@ mod tests {
 fn get_project_identifier(target_path: &str) -> anyhow::Result<(String, String)> {
     let canonical = canonicalize_target(target_path)?;
     let clean_target = clean_path(&canonical);
+    let clean_target_lower = clean_target.to_lowercase();
     
     let (_, config) = load_config()?;
     for (name, registered_path_str) in &config.projects {
         if let Ok(reg_path_buf) = PathBuf::from(registered_path_str).canonicalize() {
-            let clean_reg_path = clean_path(&reg_path_buf);
-            if clean_target == clean_reg_path {
+            let clean_reg_path_lower = clean_path(&reg_path_buf).to_lowercase();
+            if clean_target_lower == clean_reg_path_lower {
                 return Ok((name.clone(), clean_target));
             }
         }
@@ -2100,15 +2107,29 @@ async fn run_mcp_setup() -> anyhow::Result<()> {
             })
         };
 
+        let ozymem_path = home_dir.join(".cargo").join("bin").join(if cfg!(windows) { "ozymem.exe" } else { "ozymem" });
+        let ozymem_cmd = if ozymem_path.exists() {
+            ozymem_path.to_string_lossy().to_string()
+        } else {
+            "ozymem".to_string()
+        };
+
+        let token = std::env::var("OZYBASE_MCP_TOKEN")
+            .ok()
+            .or_else(|| {
+                load_config().ok().and_then(|(_, cfg)| cfg.token)
+            })
+            .unwrap_or_else(|| "ozys_8f7e_8f7e50d578a699177eba16c7".to_string());
+
         if let Some(mcp_servers) = json_val.get_mut("mcpServers") {
             if let Some(mcp_servers_obj) = mcp_servers.as_object_mut() {
                 mcp_servers_obj.insert(
                     "ozybase".to_string(),
                     serde_json::json!({
-                        "command": "ozymem",
+                        "command": ozymem_cmd,
                         "args": ["mcp", "run"],
                         "env": {
-                            "OZYBASE_MCP_TOKEN": "ozys_8f7e_8f7e50d578a699177eba16c7..."
+                            "OZYBASE_MCP_TOKEN": token
                         }
                     })
                 );
@@ -2119,10 +2140,10 @@ async fn run_mcp_setup() -> anyhow::Result<()> {
                     "mcpServers".to_string(),
                     serde_json::json!({
                         "ozybase": {
-                            "command": "ozymem",
+                            "command": ozymem_cmd,
                             "args": ["mcp", "run"],
                             "env": {
-                                "OZYBASE_MCP_TOKEN": "ozys_8f7e_8f7e50d578a699177eba16c7..."
+                                "OZYBASE_MCP_TOKEN": token
                             }
                         }
                     })

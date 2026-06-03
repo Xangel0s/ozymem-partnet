@@ -136,7 +136,7 @@ fn validate_project_path(path_str: &str) -> anyhow::Result<(String, String)> {
     for (name, registered_path_str) in &config.projects {
         if let Ok(reg_path_buf) = PathBuf::from(registered_path_str).canonicalize() {
             let clean_reg_path = clean_path_str(&reg_path_buf.to_string_lossy());
-            if clean_target == clean_reg_path {
+            if clean_target.to_lowercase() == clean_reg_path.to_lowercase() {
                 return Ok((name.clone(), registered_path_str.clone()));
             }
         }
