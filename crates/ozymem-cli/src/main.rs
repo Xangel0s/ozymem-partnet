@@ -143,6 +143,7 @@ enum Commands {
     },
     #[command(alias = "projects")]
     List,
+    Init,
     Mcp {
         #[command(subcommand)]
         subcommand: McpSubcommand,
@@ -202,6 +203,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::List => {
             return run_list();
+        }
+        Commands::Init => {
+            return run_init().await;
         }
         Commands::Mcp { subcommand } => {
             match subcommand {
@@ -268,6 +272,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Logs { .. } => unreachable!(),
         Commands::Register { .. } => unreachable!(),
         Commands::List => unreachable!(),
+        Commands::Init => unreachable!(),
         Commands::Mcp { .. } => unreachable!(),
     }
 
@@ -2211,5 +2216,143 @@ async fn run_mcp_stop() -> anyhow::Result<()> {
     }
     
     let _ = std::fs::remove_file(&pid_file);
+    Ok(())
+}
+
+async fn run_init() -> anyhow::Result<()> {
+    let (_, config) = load_config()?;
+    if config.projects.is_empty() {
+        println!("[INFO] No hay proyectos registrados todavía. Usa 'ozymem register' para registrar uno.");
+        return Ok(());
+    }
+
+    let mut project_names: Vec<String> = config.projects.keys().cloned().collect();
+    project_names.sort();
+
+    use dialoguer::{theme::ColorfulTheme, Select};
+    let selection = Select::with_theme(&ColorfulTheme::default())
+        .with_prompt("Seleccione el proyecto que desea iniciar")
+        .items(&project_names)
+        .default(0)
+        .interact_opt()?;
+
+    let Some(idx) = selection else {
+        println!("Operación cancelada.");
+        return Ok(());
+    };
+
+    let selected_project_name = &project_names[idx];
+    let selected_project_path = &config.projects[selected_project_name];
+
+    println!("[INFO] Inicializando entorno para el proyecto '{}'...", selected_project_name);
+
+    // Paso 1: Levantar e indexar la base de datos (Docker / Memgraph)
+    let mut db_connected = false;
+
+    // Primer chequeo de conexión
+    if let Ok(conn) = build_connection().await {
+        if conn.ping().await.is_ok() {
+            db_connected = true;
+        }
+    }
+
+    if !db_connected {
+        println!("[INFO] No se pudo conectar a Memgraph. Intentando arrancar contenedores Docker...");
+        
+        // Intentar docker start
+        let start_status = std::process::Command::new("docker")
+            .args(&["start", "ozymem-memgraph", "ozymem-memgraph-lab"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+
+        let mut _docker_started = match start_status {
+            Ok(status) => status.success(),
+            Err(_) => false,
+        };
+
+        if !_docker_started {
+            // Intentar docker compose up -d en la ruta de ozymem
+            if let Some(ozymem_path) = config.projects.get("ozymem") {
+                let compose_status = std::process::Command::new("docker")
+                    .args(&["compose", "up", "-d"])
+                    .current_dir(ozymem_path)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+                if let Ok(status) = compose_status {
+                    _docker_started = status.success();
+                }
+            }
+        }
+
+        // Bucle de re-intentos (retry loop)
+        for attempt in 1..=5 {
+            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+            if let Ok(conn) = build_connection().await {
+                if conn.ping().await.is_ok() {
+                    db_connected = true;
+                    break;
+                }
+            }
+            println!("[INFO] Re-intentando conexión a Memgraph (intento {}/5)...", attempt);
+        }
+    }
+
+    let db_status_str = if db_connected {
+        let uri = display_memgraph_uri();
+        format!("CONECTADO ({})", uri)
+    } else {
+        "MODO WAL (Resiliencia local / Desconectado)".to_string()
+    };
+
+    // Paso 2: Iniciar Servidor MCP en segundo plano (si la DB está activa o de forma resiliente)
+    let mcp_res = run_mcp_start().await;
+    let mcp_status_str = match mcp_res {
+        Ok(_) => {
+            let home_dir = home::home_dir().unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+            let pid_file = home_dir.join(".ozymem-mcp.pid");
+            if pid_file.exists() {
+                let pid_str = std::fs::read_to_string(&pid_file).unwrap_or_default().trim().to_string();
+                format!("ACTIVO (PID: {})", pid_str)
+            } else {
+                "ACTIVO".to_string()
+            }
+        }
+        Err(e) => format!("ERROR ({:?})", e),
+    };
+
+    // Paso 3: Levantar el Watcher del proyecto seleccionado
+    let watcher_res = run_start(Some(selected_project_path.clone()), false);
+    let watcher_status_str = match watcher_res {
+        Ok(_) => {
+            let home_dir = home::home_dir().unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+            let pid_file = home_dir.join(format!(".ozymem-{}.pid", selected_project_name));
+            if pid_file.exists() {
+                let pid_str = std::fs::read_to_string(&pid_file).unwrap_or_default().trim().to_string();
+                format!("ACTIVO (PID: {})", pid_str)
+            } else {
+                "ACTIVO".to_string()
+            }
+        }
+        Err(e) => format!("ERROR ({:?})", e),
+    };
+
+    // Limpiar pantalla e imprimir resumen espectacular
+    print!("\x1B[2J\x1B[1;1H");
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+
+    println!("[SUCCESS] ¡Entorno Ozymem inicializado con éxito!");
+    println!();
+    println!("Resumen de Servicios:");
+    println!("  ✔ Docker / Memgraph: {}", db_status_str);
+    println!("  ✔ Servidor MCP:      {}", mcp_status_str);
+    println!("  ✔ Watcher Proyecto:  {} -> {}", watcher_status_str, selected_project_path);
+    println!();
+    println!("Para auditar los registros en tiempo real, utiliza:");
+    println!("  - Logs del Watcher:  ozymem logs {}", selected_project_name);
+    println!("  - Logs del MCP:      ozymem logs mcp");
+
     Ok(())
 }
