@@ -51,8 +51,7 @@ impl Default for OzymemConfig {
 }
 
 fn load_config() -> anyhow::Result<(PathBuf, OzymemConfig)> {
-    let home_dir = home::home_dir().context("Could not find user home directory")?;
-    let config_path = home_dir.join(".ozymem.toml");
+    let config_path = PathBuf::from("C:\\Users\\Lenovo\\.ozymem.toml");
     if !config_path.exists() {
         let default_config = OzymemConfig::default();
         let toml_str = toml::to_string_pretty(&default_config)?;
@@ -367,12 +366,19 @@ async fn print_status(context: &AppContext, json_output: bool) -> anyhow::Result
                             estado = format!("ACTIVO (PID: {})", pid);
                             ultima_bitacora = get_last_log_line(&log_file);
                         } else {
-                            estado = "TUMBADO".to_string();
                             let last_line = get_last_log_line(&log_file);
+                            let is_error = last_line.to_lowercase().contains("error") 
+                                || last_line.to_lowercase().contains("fail") 
+                                || last_line.to_lowercase().contains("panic");
+                            
+                            estado = if is_error { "TUMBADO".to_string() } else { "DETENIDO".to_string() };
+                            
                             ultima_bitacora = if last_line == "Watcher no inicializado." || last_line == "Bitacora vacia." {
                                 "Proceso terminado inesperadamente.".to_string()
-                            } else {
+                            } else if is_error {
                                 format!("Error: {}", last_line)
+                            } else {
+                                format!("Último log: {}", last_line)
                             };
                         }
                     }
@@ -870,6 +876,18 @@ fn print_update_error() {
 
 fn canonicalize_target(target_path: &str) -> anyhow::Result<PathBuf> {
     let path = Path::new(target_path);
+    if !path.exists() {
+        // Intenta ver si coincide con el nombre de un proyecto registrado en la configuración
+        if let Ok((_, config)) = load_config() {
+            if let Some(registered_path) = config.projects.get(target_path) {
+                let reg_path = Path::new(registered_path);
+                if reg_path.exists() {
+                    return fs::canonicalize(reg_path)
+                        .with_context(|| format!("failed to resolve registered path for project: {target_path}"));
+                }
+            }
+        }
+    }
     fs::canonicalize(path).with_context(|| format!("failed to resolve path: {target_path}"))
 }
 

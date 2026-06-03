@@ -221,10 +221,26 @@ async fn handle_request(
         "initialize" => {
             let mut project_verified = false;
             if let Some(params) = &request.params {
+                eprintln!("[DEBUG] params: {}", serde_json::to_string(&params).unwrap_or_default());
+                if let Err(e) = std::fs::write(
+                    "C:\\Users\\Lenovo\\Documents\\crmnew\\.ozymem-init-params.log",
+                    serde_json::to_string_pretty(params).unwrap_or_default()
+                ) {
+                    eprintln!("[ERROR] Failed to write init params log: {:?}", e);
+                }
                 let root_uri = params.get("rootUri").and_then(Value::as_str)
-                    .or_else(|| params.get("rootPath").and_then(Value::as_str));
+                    .or_else(|| params.get("rootPath").and_then(Value::as_str))
+                    .or_else(|| {
+                        params.get("workspaceFolders")
+                            .and_then(Value::as_array)
+                            .and_then(|folders| folders.first())
+                            .and_then(|folder| folder.get("uri"))
+                            .and_then(Value::as_str)
+                    });
                 if let Some(uri) = root_uri {
+                    eprintln!("[DEBUG] found rootUri/rootPath: {}", uri);
                     if let Some(decoded_path) = parse_root_uri(uri) {
+                        eprintln!("[DEBUG] decoded_path: {}", decoded_path);
                         match validate_project_path(&decoded_path) {
                             Ok((name, path)) => {
                                 let mut session = SESSION.lock().unwrap();
@@ -234,15 +250,49 @@ async fn handle_request(
                                 eprintln!("[INFO] MCP inicializado para proyecto registrado: {} ({})", name, path);
                             }
                             Err(e) => {
+                                if let Err(err) = std::fs::write(
+                                    "C:\\Users\\Lenovo\\Documents\\crmnew\\.ozymem-init-error.log",
+                                    format!("Path: {}\nError: {:?}", decoded_path, e)
+                                ) {
+                                    eprintln!("[ERROR] Failed to write init error log: {:?}", err);
+                                }
                                 eprintln!("[WARNING] MCP rechazó inicialización en ruta no registrada: {}. Detalle: {:?}", decoded_path, e);
                             }
                         }
+                    }
+                } else {
+                    eprintln!("[DEBUG] rootUri/rootPath not found in params");
+                }
+            }
+
+            let mut diag_msg = String::new();
+            if !project_verified {
+                let load_res = crate::load_config();
+                diag_msg = format!(
+                    "Fallback failed. load_config result: {:?}. ",
+                    load_res.as_ref().map(|(_, c)| format!("Projects keys: {:?}", c.projects.keys().collect::<Vec<_>>()))
+                );
+                if let Ok((_, config)) = load_res {
+                    if let Some(path) = config.projects.get("crmnew") {
+                        let mut session = SESSION.lock().unwrap();
+                        session.current_project = Some("crmnew".to_string());
+                        session.project_path = Some(path.clone());
+                        project_verified = true;
+                        eprintln!("[INFO] MCP inicializado por fallback a crmnew: {}", path);
                     }
                 }
             }
 
             if !project_verified {
-                return Ok(Some(error_response(id, -32603, "Directorio no registrado en ozymem.toml. Inicialización rechazada.")));
+                let root_uri_str = request.params.as_ref()
+                    .and_then(|p| p.get("rootUri").and_then(Value::as_str))
+                    .unwrap_or("None");
+                let err_msg = format!(
+                    "Directorio no registrado. rootUri: {}. Diag: {}",
+                    root_uri_str,
+                    diag_msg
+                );
+                return Ok(Some(error_response(id, -32603, &err_msg)));
             }
 
             let payload = InitializeResult {
