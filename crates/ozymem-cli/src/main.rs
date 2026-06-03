@@ -153,6 +153,8 @@ enum Commands {
 pub enum McpSubcommand {
     Run,
     Setup,
+    Start,
+    Stop,
 }
 
 struct AppContext {
@@ -208,6 +210,12 @@ async fn main() -> anyhow::Result<()> {
                 }
                 McpSubcommand::Setup => {
                     return run_mcp_setup().await;
+                }
+                McpSubcommand::Start => {
+                    return run_mcp_start().await;
+                }
+                McpSubcommand::Stop => {
+                    return run_mcp_stop().await;
                 }
             }
         }
@@ -366,6 +374,36 @@ async fn print_status(context: &AppContext, json_output: bool) -> anyhow::Result
             
             println!("| {:<15} | {:<40} | {:<21} | {:<59} |", name, shortened_path, estado, ultima_bitacora);
         }
+        
+        // Fila dedicada al servicio general del Servidor MCP (ozymem-mcp)
+        let mcp_pid_file = home_dir.join(".ozymem-mcp.pid");
+        let mcp_log_file = home_dir.join(".ozymem-mcp.log");
+        let mut mcp_estado = "INACTIVO".to_string();
+        let mut mcp_ultima_bitacora = "Servidor no inicializado.".to_string();
+        
+        if mcp_pid_file.exists() {
+            if let Ok(pid_str) = std::fs::read_to_string(&mcp_pid_file) {
+                if let Ok(pid) = pid_str.trim().parse::<u32>() {
+                    if is_pid_alive(pid) {
+                        mcp_estado = format!("ACTIVO (PID: {})", pid);
+                        mcp_ultima_bitacora = get_last_log_line(&mcp_log_file);
+                    } else {
+                        mcp_estado = "TUMBADO".to_string();
+                        // Zombie PID auto-cleanup
+                        let _ = std::fs::remove_file(&mcp_pid_file);
+                        let last_line = get_last_log_line(&mcp_log_file);
+                        mcp_ultima_bitacora = if last_line == "Watcher no inicializado." || last_line == "Bitacora vacia." || last_line == "Servidor no inicializado." {
+                            "Proceso terminado inesperadamente.".to_string()
+                        } else {
+                            format!("Error: {}", last_line)
+                        };
+                    }
+                }
+            }
+        }
+        
+        println!("| {:<15} | {:<40} | {:<21} | {:<59} |", "ozymem-mcp", "Servidor Global de Red / Stdio", mcp_estado, mcp_ultima_bitacora);
+        
         println!("+-----------------+------------------------------------------+-----------------------+-------------------------------------------------------------+");
     }
 
@@ -2090,5 +2128,86 @@ async fn run_mcp_setup() -> anyhow::Result<()> {
         println!("[SUCCESS] Configuracion inyectada con exito en: {}", path.display());
     }
 
+    Ok(())
+}
+
+fn kill_pid(pid: u32) -> anyhow::Result<()> {
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(&["/PID", &pid.to_string(), "/F"])
+            .status()?;
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = std::process::Command::new("kill")
+            .args(&["-9", &pid.to_string()])
+            .status()?;
+    }
+    Ok(())
+}
+
+async fn run_mcp_start() -> anyhow::Result<()> {
+    let home_dir = home::home_dir().unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    let pid_file = home_dir.join(".ozymem-mcp.pid");
+    
+    if pid_file.exists() {
+        if let Ok(pid_str) = std::fs::read_to_string(&pid_file) {
+            if let Ok(pid) = pid_str.trim().parse::<u32>() {
+                if is_pid_alive(pid) {
+                    println!("[INFO] El servidor MCP ya se encuentra activo bajo el PID {}.", pid);
+                    return Ok(());
+                } else {
+                    let _ = std::fs::remove_file(&pid_file);
+                }
+            }
+        }
+    }
+
+    let exe_path = std::env::current_exe()?;
+    let mut cmd = std::process::Command::new(exe_path);
+    cmd.arg("mcp").arg("run");
+    cmd.env("OZYMEM_DAEMON", "1");
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
+
+    let log_path = home_dir.join(".ozymem-mcp.log");
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)?;
+    let stdout_file = log_file.try_clone()?;
+    let stderr_file = log_file.try_clone()?;
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(stdout_file);
+    cmd.stderr(stderr_file);
+
+    let child = cmd.spawn()?;
+    let pid = child.id();
+    std::fs::write(&pid_file, pid.to_string())?;
+    println!("[SUCCESS] Servidor MCP iniciado en segundo plano (PID: {})", pid);
+    Ok(())
+}
+
+async fn run_mcp_stop() -> anyhow::Result<()> {
+    let home_dir = home::home_dir().unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    let pid_file = home_dir.join(".ozymem-mcp.pid");
+    
+    if !pid_file.exists() {
+        println!("[ERROR] No se encontró ningún proceso activo para el servidor MCP.");
+        return Ok(());
+    }
+
+    let pid_str = std::fs::read_to_string(&pid_file)?.trim().to_string();
+    if let Ok(pid) = pid_str.parse::<u32>() {
+        kill_pid(pid)?;
+        println!("[SUCCESS] Proceso del servidor MCP (PID: {}) detenido y limpiado.", pid_str);
+    }
+    
+    let _ = std::fs::remove_file(&pid_file);
     Ok(())
 }

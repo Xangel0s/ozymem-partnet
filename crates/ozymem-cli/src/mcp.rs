@@ -147,7 +147,7 @@ fn validate_project_path(path_str: &str) -> anyhow::Result<(String, String)> {
 
 pub async fn run_mcp_server() -> anyhow::Result<()> {
     // Force logs to stderr to protect stdout data channel
-    eprintln!("[INFO] Iniciando servidor MCP de Ozymem...");
+    eprintln!("[INFO] Iniciando servidor MCP de Ozymem... (OZYMEM_DAEMON={:?})", std::env::var("OZYMEM_DAEMON"));
 
     let connection_cell = Arc::new(OnceCell::new());
     let mut stdin = BufReader::new(io::stdin());
@@ -156,7 +156,13 @@ pub async fn run_mcp_server() -> anyhow::Result<()> {
     let mut line = String::new();
     while {
         line.clear();
-        stdin.read_line(&mut line).await? > 0
+        match stdin.read_line(&mut line).await {
+            Ok(bytes) => bytes > 0,
+            Err(e) => {
+                eprintln!("[ERROR] Error leyendo stdin: {:?}", e);
+                false
+            }
+        }
     } {
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -169,6 +175,14 @@ pub async fn run_mcp_server() -> anyhow::Result<()> {
             }
         } else {
             eprintln!("[WARNING] Recibida línea no válida para JSON-RPC: {}", trimmed);
+        }
+    }
+
+    eprintln!("[INFO] Bucle de lectura de stdin terminado.");
+    if std::env::var("OZYMEM_DAEMON").is_ok() {
+        eprintln!("[INFO] Entrando en modo daemon de bucle de sueño infinito...");
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_secs(3600)).await;
         }
     }
 
