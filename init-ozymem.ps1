@@ -10,6 +10,12 @@ Write-Host "Iniciando proceso de preparacion de Ozymem..." -ForegroundColor Cyan
 # 1. Verificar prerrequisitos
 Write-Host "Verificando dependencias en el sistema..." -ForegroundColor Gray
 
+# Cargar el path de Cargo si existe y no esta en la sesion actual
+$CargoBinPath = Join-Path $env:USERPROFILE ".cargo\bin"
+if ((Test-Path $CargoBinPath) -and ($env:PATH -notlike "*$CargoBinPath*")) {
+    $env:PATH = "$env:PATH;$CargoBinPath"
+}
+
 if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
     Write-Error "Docker no esta instalado o no se encuentra en el PATH del sistema."
     Exit 1

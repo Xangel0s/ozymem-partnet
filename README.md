@@ -59,6 +59,8 @@ ozymem tree <ruta_al_archivo> --depth 2
 
 ## Servidor MCP
 
+Para obtener una guía detallada de configuración e integración del protocolo MCP en tu entorno de desarrollo, consulta la [Guía de Configuración y Requisitos de MCP](docs/mcp_setup_guide.md).
+
 Para iniciar el servidor del Protocolo de Contexto de Modelos (MCP) y permitir la comunicación directa con IDEs (como Cursor o Claude Desktop):
 
 ```bash

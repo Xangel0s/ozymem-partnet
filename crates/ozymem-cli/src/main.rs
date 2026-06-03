@@ -132,8 +132,12 @@ enum Commands {
         #[arg(long)]
         force: bool,
     },
-    Stop,
-    Logs,
+    Stop {
+        project: Option<String>,
+    },
+    Logs {
+        project: Option<String>,
+    },
     Register {
         name: Option<String>,
     },
@@ -148,6 +152,7 @@ enum Commands {
 #[derive(Debug, Subcommand)]
 pub enum McpSubcommand {
     Run,
+    Setup,
 }
 
 struct AppContext {
@@ -184,11 +189,11 @@ async fn main() -> anyhow::Result<()> {
         Commands::Start { path, force } => {
             return run_start(path.clone(), *force);
         }
-        Commands::Stop => {
-            return run_stop();
+        Commands::Stop { project } => {
+            return run_stop(project.clone());
         }
-        Commands::Logs => {
-            return run_logs_tail().await;
+        Commands::Logs { project } => {
+            return run_logs_tail(project.clone()).await;
         }
         Commands::Register { name } => {
             return run_register(name.clone());
@@ -196,8 +201,15 @@ async fn main() -> anyhow::Result<()> {
         Commands::List => {
             return run_list();
         }
-        Commands::Mcp { subcommand: McpSubcommand::Run } => {
-            return mcp::run_mcp_server().await;
+        Commands::Mcp { subcommand } => {
+            match subcommand {
+                McpSubcommand::Run => {
+                    return mcp::run_mcp_server().await;
+                }
+                McpSubcommand::Setup => {
+                    return run_mcp_setup().await;
+                }
+            }
         }
         _ => {}
     }
@@ -244,8 +256,8 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Commands::Start { .. } => unreachable!(),
-        Commands::Stop => unreachable!(),
-        Commands::Logs => unreachable!(),
+        Commands::Stop { .. } => unreachable!(),
+        Commands::Logs { .. } => unreachable!(),
         Commands::Register { .. } => unreachable!(),
         Commands::List => unreachable!(),
         Commands::Mcp { .. } => unreachable!(),
@@ -311,6 +323,51 @@ async fn print_status(context: &AppContext, json_output: bool) -> anyhow::Result
         "  Files: {} | Functions: {} | Engrams: {}",
         summary.file_count, summary.function_count, summary.engram_count
     );
+
+    // Tabla de Monitoreo Centralizado de Watchers por Proyecto
+    let home_dir = home::home_dir().unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    if let Ok((_, config)) = load_config() {
+        println!();
+        println!("Project Environment Watchers:");
+        println!("+-----------------+------------------------------------------+-----------------------+-------------------------------------------------------------+");
+        println!("| {:<15} | {:<40} | {:<21} | {:<59} |", "Proyecto", "Ruta Asignada", "Estado", "Ultima Bitacora");
+        println!("+-----------------+------------------------------------------+-----------------------+-------------------------------------------------------------+");
+        
+        let mut sorted_projects: Vec<(&String, &String)> = config.projects.iter().collect();
+        sorted_projects.sort_by(|a, b| a.0.cmp(b.0));
+        
+        for (name, path) in sorted_projects {
+            let pid_file = home_dir.join(format!(".ozymem-{}.pid", name));
+            let log_file = home_dir.join(format!(".ozymem-{}.log", name));
+            
+            let shortened_path = shorten_path(path, 40);
+            
+            let mut estado = "INACTIVO".to_string();
+            let mut ultima_bitacora = "Watcher no inicializado.".to_string();
+            
+            if pid_file.exists() {
+                if let Ok(pid_str) = std::fs::read_to_string(&pid_file) {
+                    if let Ok(pid) = pid_str.trim().parse::<u32>() {
+                        if is_pid_alive(pid) {
+                            estado = format!("ACTIVO (PID: {})", pid);
+                            ultima_bitacora = get_last_log_line(&log_file);
+                        } else {
+                            estado = "TUMBADO".to_string();
+                            let last_line = get_last_log_line(&log_file);
+                            ultima_bitacora = if last_line == "Watcher no inicializado." || last_line == "Bitacora vacia." {
+                                "Proceso terminado inesperadamente.".to_string()
+                            } else {
+                                format!("Error: {}", last_line)
+                            };
+                        }
+                    }
+                }
+            }
+            
+            println!("| {:<15} | {:<40} | {:<21} | {:<59} |", name, shortened_path, estado, ultima_bitacora);
+        }
+        println!("+-----------------+------------------------------------------+-----------------------+-------------------------------------------------------------+");
+    }
 
     Ok(())
 }
@@ -1446,12 +1503,6 @@ fn is_garbage_file(path: &Path) -> bool {
 
 fn run_start(path_arg: Option<String>, force: bool) -> anyhow::Result<()> {
     let home_dir = home::home_dir().unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-    let pid_file = home_dir.join(".ozymem.pid");
-    if pid_file.exists() {
-        println!("[INFO] El watcher ya se encuentra activo o el archivo .ozymem.pid ya existe.");
-        return Ok(());
-    }
-
     let target_path = path_arg.unwrap_or_else(|| ".".to_string());
     
     // Authorization Check
@@ -1462,6 +1513,21 @@ fn run_start(path_arg: Option<String>, force: bool) -> anyhow::Result<()> {
         let err_msg = "Error: No se permite indexar desde la raíz del perfil de usuario por seguridad. Muévete a la carpeta de tu proyecto.";
         println!("{}", err_msg);
         return Err(anyhow::anyhow!(err_msg));
+    }
+
+    // Get project identifier
+    let (project_name, _) = get_project_identifier(&target_path)?;
+
+    let pid_file = home_dir.join(format!(".ozymem-{}.pid", project_name));
+    if pid_file.exists() {
+        if let Ok(pid_str) = std::fs::read_to_string(&pid_file) {
+            if let Ok(pid) = pid_str.trim().parse::<u32>() {
+                if is_pid_alive(pid) {
+                    println!("[INFO] El watcher para '{}' ya se encuentra activo (PID: {}).", project_name, pid);
+                    return Ok(());
+                }
+            }
+        }
     }
 
     let exe_path = std::env::current_exe()?;
@@ -1477,7 +1543,7 @@ fn run_start(path_arg: Option<String>, force: bool) -> anyhow::Result<()> {
         cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
     }
 
-    let log_path = home_dir.join(".ozymem.log");
+    let log_path = home_dir.join(format!(".ozymem-{}.log", project_name));
     let log_file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -1490,7 +1556,7 @@ fn run_start(path_arg: Option<String>, force: bool) -> anyhow::Result<()> {
     let child = cmd.spawn()?;
     let pid = child.id();
     std::fs::write(&pid_file, pid.to_string())?;
-    println!("[SUCCESS] Watcher iniciado en segundo plano de forma exitosa (PID: {}).", pid);
+    println!("[SUCCESS] Watcher para '{}' iniciado en segundo plano de forma exitosa (PID: {}).", project_name, pid);
     Ok(())
 }
 
@@ -1561,11 +1627,47 @@ fn run_list() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_stop() -> anyhow::Result<()> {
+fn run_stop(project_arg: Option<String>) -> anyhow::Result<()> {
     let home_dir = home::home_dir().unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-    let pid_file = home_dir.join(".ozymem.pid");
+    
+    let project_name = match project_arg {
+        Some(p) => p,
+        None => {
+            let current_dir = std::env::current_dir()?;
+            let cleaned_curr = clean_path(&current_dir.canonicalize()?);
+            let mut found_name = None;
+            if let Ok((_, config)) = load_config() {
+                for (name, registered_path_str) in &config.projects {
+                    if let Ok(reg_path_buf) = PathBuf::from(registered_path_str).canonicalize() {
+                        if clean_path(&reg_path_buf) == cleaned_curr {
+                            found_name = Some(name.clone());
+                            break;
+                        }
+                    }
+                }
+            }
+            match found_name {
+                Some(name) => name,
+                None => {
+                    let global_pid = home_dir.join(".ozymem.pid");
+                    if global_pid.exists() {
+                        let pid_str = std::fs::read_to_string(&global_pid)?.trim().to_string();
+                        let _ = std::process::Command::new("taskkill")
+                            .args(&["/PID", &pid_str, "/F"])
+                            .status()?;
+                        let _ = std::fs::remove_file(&global_pid);
+                        println!("[SUCCESS] Proceso del watcher global (PID: {}) detenido y limpiado.", pid_str);
+                        return Ok(());
+                    }
+                    return Err(anyhow::anyhow!("No se pudo determinar el proyecto del directorio actual. Especifica el nombre del proyecto."));
+                }
+            }
+        }
+    };
+
+    let pid_file = home_dir.join(format!(".ozymem-{}.pid", project_name));
     if !pid_file.exists() {
-        println!("[ERROR] No se encontró ningún proceso activo (.ozymem.pid ausente).");
+        println!("[ERROR] No se encontró ningún proceso activo para el proyecto '{}'.", project_name);
         return Ok(());
     }
 
@@ -1575,15 +1677,41 @@ fn run_stop() -> anyhow::Result<()> {
         .status()?;
 
     let _ = std::fs::remove_file(&pid_file);
-    println!("[SUCCESS] Proceso del watcher (PID: {}) detenido y limpiado.", pid_str);
+    println!("[SUCCESS] Proceso del watcher para '{}' (PID: {}) detenido y limpiado.", project_name, pid_str);
     Ok(())
 }
 
-async fn run_logs_tail() -> anyhow::Result<()> {
+async fn run_logs_tail(project_arg: Option<String>) -> anyhow::Result<()> {
     let home_dir = home::home_dir().unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-    let path = home_dir.join(".ozymem.log");
+    
+    let project_name = match project_arg {
+        Some(p) => p,
+        None => {
+            let current_dir = std::env::current_dir()?;
+            let cleaned_curr = clean_path(&current_dir.canonicalize()?);
+            let mut found_name = "global".to_string();
+            if let Ok((_, config)) = load_config() {
+                for (name, registered_path_str) in &config.projects {
+                    if let Ok(reg_path_buf) = PathBuf::from(registered_path_str).canonicalize() {
+                        if clean_path(&reg_path_buf) == cleaned_curr {
+                            found_name = name.clone();
+                            break;
+                        }
+                    }
+                }
+            }
+            found_name
+        }
+    };
+    
+    let path = if project_name == "global" {
+        home_dir.join(".ozymem.log")
+    } else {
+        home_dir.join(format!(".ozymem-{}.log", project_name))
+    };
+
     if !path.exists() {
-        println!("[INFO] No hay registros de logs disponibles todavía.");
+        println!("[INFO] No hay registros de logs disponibles todavía para '{}'.", project_name);
         return Ok(());
     }
 
@@ -1700,4 +1828,267 @@ mod tests {
             format!("bolt://{}", default_memgraph_uri())
         );
     }
+}
+
+fn get_project_identifier(target_path: &str) -> anyhow::Result<(String, String)> {
+    let canonical = canonicalize_target(target_path)?;
+    let clean_target = clean_path(&canonical);
+    
+    let (_, config) = load_config()?;
+    for (name, registered_path_str) in &config.projects {
+        if let Ok(reg_path_buf) = PathBuf::from(registered_path_str).canonicalize() {
+            let clean_reg_path = clean_path(&reg_path_buf);
+            if clean_target == clean_reg_path {
+                return Ok((name.clone(), clean_target));
+            }
+        }
+    }
+    
+    let folder_name = canonical.file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    Ok((format!("unregistered-{}", folder_name), clean_target))
+}
+
+fn is_pid_alive(pid: u32) -> bool {
+    #[cfg(windows)]
+    {
+        let output = std::process::Command::new("tasklist")
+            .args(&["/FI", &format!("PID eq {}", pid), "/NH"])
+            .output();
+        if let Ok(out) = output {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            stdout.contains(&pid.to_string())
+        } else {
+            false
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let status = std::process::Command::new("kill")
+            .args(&["-0", &pid.to_string()])
+            .status();
+        match status {
+            Ok(s) => s.success(),
+            Err(_) => false,
+        }
+    }
+}
+
+fn get_last_log_line(log_path: &Path) -> String {
+    if !log_path.exists() {
+        return "Watcher no inicializado.".to_string();
+    }
+    if let Ok(content) = std::fs::read_to_string(log_path) {
+        let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
+        if let Some(last) = lines.last() {
+            let last_str = last.trim();
+            if last_str.len() > 60 {
+                format!("{}...", &last_str[..57])
+            } else {
+                last_str.to_string()
+            }
+        } else {
+            "Bitacora vacia.".to_string()
+        }
+    } else {
+        "Error al leer bitacora.".to_string()
+    }
+}
+
+fn shorten_path(path_str: &str, max_len: usize) -> String {
+    if path_str.len() <= max_len {
+        return path_str.to_string();
+    }
+    let separator = if path_str.contains('\\') { '\\' } else { '/' };
+    let components: Vec<&str> = path_str.split(separator).collect();
+    
+    let mut result = String::new();
+    let mut current_len = 3;
+    for comp in components.iter().rev() {
+        if current_len + comp.len() + 1 > max_len {
+            break;
+        }
+        if result.is_empty() {
+            result = comp.to_string();
+        } else {
+            result = format!("{}{}{}", comp, separator, result);
+        }
+        current_len += comp.len() + 1;
+    }
+    
+    if result.is_empty() {
+        format!("...{}", &path_str[path_str.len() - max_len + 3..])
+    } else {
+        format!("...{}{}", separator, result)
+    }
+}
+
+async fn run_mcp_setup() -> anyhow::Result<()> {
+    let home_dir = home::home_dir().context("No se pudo determinar el directorio home.")?;
+    let appdata = std::env::var("APPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| home_dir.join("AppData").join("Roaming"));
+
+    struct McpTarget {
+        name: &'static str,
+        path: PathBuf,
+    }
+
+    let targets = vec![
+        McpTarget {
+            name: "VS Code (Antigravity / Claude Dev)",
+            path: home_dir.join(".gemini").join("antigravity").join("mcp_config.json"),
+        },
+        McpTarget {
+            name: "Cursor Editor",
+            path: appdata.join("Cursor").join("User").join("globalStorage").join("saoudrizwan.claude-dev").join("settings").join("mcp_config.json"),
+        },
+        McpTarget {
+            name: "Claude Desktop",
+            path: appdata.join("Claude").join("claude_desktop_config.json"),
+        },
+    ];
+
+    let mut detected = Vec::new();
+    for target in targets {
+        if target.path.exists() {
+            detected.push(target);
+        }
+    }
+
+    let selected_target = if detected.is_empty() {
+        println!("No se detecto ningun archivo de configuracion MCP activo en las rutas conocidas.");
+        println!("Desea inicializar uno nuevo en alguna de estas rutas?");
+        println!("1) VS Code (Antigravity / Claude Dev)");
+        println!("2) Cursor Editor");
+        println!("3) Claude Desktop");
+        print!("Seleccione una opcion (o presione Enter para salir): ");
+        use std::io::Write;
+        std::io::stdout().flush()?;
+        
+        let mut choice_str = String::new();
+        std::io::stdin().read_line(&mut choice_str)?;
+        let choice = choice_str.trim().parse::<usize>().ok();
+        
+        let targets_all = vec![
+            McpTarget {
+                name: "VS Code (Antigravity / Claude Dev)",
+                path: home_dir.join(".gemini").join("antigravity").join("mcp_config.json"),
+            },
+            McpTarget {
+                name: "Cursor Editor",
+                path: appdata.join("Cursor").join("User").join("globalStorage").join("saoudrizwan.claude-dev").join("settings").join("mcp_config.json"),
+            },
+            McpTarget {
+                name: "Claude Desktop",
+                path: appdata.join("Claude").join("claude_desktop_config.json"),
+            },
+        ];
+        
+        match choice {
+            Some(1) => targets_all.into_iter().nth(0),
+            Some(2) => targets_all.into_iter().nth(1),
+            Some(3) => targets_all.into_iter().nth(2),
+            _ => {
+                println!("Operacion cancelada.");
+                return Ok(());
+            }
+        }
+    } else if detected.len() == 1 {
+        let target = detected.remove(0);
+        print!("Se detecto un unico entorno configurable: {} [{}]\n¿Desea configurar este entorno? (y/n): ", target.name, target.path.display());
+        use std::io::Write;
+        std::io::stdout().flush()?;
+        let mut confirm_str = String::new();
+        std::io::stdin().read_line(&mut confirm_str)?;
+        if confirm_str.trim().to_lowercase().starts_with('y') {
+            Some(target)
+        } else {
+            println!("Operacion cancelada.");
+            return Ok(());
+        }
+    } else {
+        println!("Se detectaron multiples entornos MCP configurables:");
+        for (i, target) in detected.iter().enumerate() {
+            println!("{}) {} [{}]", i + 1, target.name, target.path.display());
+        }
+        print!("Seleccione el numero del entorno que desea configurar: ");
+        use std::io::Write;
+        std::io::stdout().flush()?;
+        
+        let mut choice_str = String::new();
+        std::io::stdin().read_line(&mut choice_str)?;
+        let choice = choice_str.trim().parse::<usize>().ok();
+        match choice {
+            Some(idx) if idx > 0 && idx <= detected.len() => {
+                Some(detected.remove(idx - 1))
+            }
+            _ => {
+                println!("Seleccion invalida. Operacion cancelada.");
+                return Ok(());
+            }
+        }
+    };
+
+    if let Some(target) = selected_target {
+        let path = target.path;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        
+        let content = if path.exists() {
+            std::fs::read_to_string(&path).unwrap_or_default()
+        } else {
+            String::new()
+        };
+
+        let mut json_val: serde_json::Value = if content.trim().is_empty() {
+            serde_json::json!({
+                "mcpServers": {}
+            })
+        } else {
+            serde_json::from_str(&content).unwrap_or_else(|_| {
+                serde_json::json!({
+                    "mcpServers": {}
+                })
+            })
+        };
+
+        if let Some(mcp_servers) = json_val.get_mut("mcpServers") {
+            if let Some(mcp_servers_obj) = mcp_servers.as_object_mut() {
+                mcp_servers_obj.insert(
+                    "ozybase".to_string(),
+                    serde_json::json!({
+                        "command": "ozymem",
+                        "args": ["mcp", "run"],
+                        "env": {
+                            "OZYBASE_MCP_TOKEN": "ozys_8f7e_8f7e50d578a699177eba16c7..."
+                        }
+                    })
+                );
+            }
+        } else {
+            if let Some(obj) = json_val.as_object_mut() {
+                obj.insert(
+                    "mcpServers".to_string(),
+                    serde_json::json!({
+                        "ozybase": {
+                            "command": "ozymem",
+                            "args": ["mcp", "run"],
+                            "env": {
+                                "OZYBASE_MCP_TOKEN": "ozys_8f7e_8f7e50d578a699177eba16c7..."
+                            }
+                        }
+                    })
+                );
+            }
+        }
+
+        let pretty_json = serde_json::to_string_pretty(&json_val)?;
+        std::fs::write(&path, pretty_json)?;
+        println!("[SUCCESS] Configuracion inyectada con exito en: {}", path.display());
+    }
+
+    Ok(())
 }

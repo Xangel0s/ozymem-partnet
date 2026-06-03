@@ -1,11 +1,12 @@
-use anyhow::Context;
 use ozymem_core::{
     default_memgraph_database, default_memgraph_uri, FileGraphContext, GraphSummary,
     MemgraphConfig, MemgraphConnection,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use tokio::io::{self, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use std::sync::Arc;
+use tokio::sync::OnceCell;
+use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 #[derive(Debug, Deserialize)]
 struct JsonRpcRequest {
@@ -45,7 +46,10 @@ struct ServerCapabilities {
 }
 
 #[derive(Debug, Serialize)]
-struct ToolsCapability {}
+struct ToolsCapability {
+    #[serde(rename = "listChanged", skip_serializing_if = "Option::is_none")]
+    list_changed: Option<bool>,
+}
 
 #[derive(Debug, Serialize)]
 struct ServerInfo {
@@ -82,33 +86,51 @@ struct ContentBlock {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let connection = MemgraphConnection::connect(MemgraphConfig {
-        uri: std::env::var("MEMGRAPH_URI").unwrap_or_else(|_| default_memgraph_uri().to_string()),
-        user: std::env::var("MEMGRAPH_USER").unwrap_or_else(|_| "admin".to_string()),
-        password: std::env::var("MEMGRAPH_PASSWORD").unwrap_or_else(|_| "admin".to_string()),
-        database: std::env::var("MEMGRAPH_DATABASE")
-            .unwrap_or_else(|_| default_memgraph_database().to_string()),
-    })
-    .await?;
-
-    run_server(connection).await
+    let connection_cell = Arc::new(OnceCell::new());
+    run_server(connection_cell).await
 }
 
-async fn run_server(connection: MemgraphConnection) -> anyhow::Result<()> {
+async fn run_server(connection_cell: Arc<OnceCell<MemgraphConnection>>) -> anyhow::Result<()> {
     let mut stdin = BufReader::new(io::stdin());
     let mut stdout = io::stdout();
 
-    while let Some(request) = read_request(&mut stdin).await? {
-        if let Some(response) = handle_request(&connection, request).await? {
-            write_response(&mut stdout, &response).await?;
+    let mut line = String::new();
+    while {
+        line.clear();
+        stdin.read_line(&mut line).await? > 0
+    } {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        if let Ok(request) = serde_json::from_str::<JsonRpcRequest>(trimmed) {
+            if let Some(response) = handle_request(&connection_cell, request).await? {
+                write_response(&mut stdout, &response).await?;
+            }
+        } else {
+            eprintln!("[WARNING] Recibida línea no válida para JSON-RPC: {}", trimmed);
         }
     }
 
     Ok(())
 }
 
+async fn get_connection(cell: &OnceCell<MemgraphConnection>) -> anyhow::Result<&MemgraphConnection> {
+    cell.get_or_try_init(|| async {
+        let config = MemgraphConfig {
+            uri: std::env::var("MEMGRAPH_URI").unwrap_or_else(|_| default_memgraph_uri().to_string()),
+            user: std::env::var("MEMGRAPH_USER").unwrap_or_else(|_| "admin".to_string()),
+            password: std::env::var("MEMGRAPH_PASSWORD").unwrap_or_else(|_| "admin".to_string()),
+            database: std::env::var("MEMGRAPH_DATABASE")
+                .unwrap_or_else(|_| default_memgraph_database().to_string()),
+        };
+        MemgraphConnection::connect(config).await
+    }).await
+}
+
 async fn handle_request(
-    connection: &MemgraphConnection,
+    connection_cell: &OnceCell<MemgraphConnection>,
     request: JsonRpcRequest,
 ) -> anyhow::Result<Option<JsonRpcResponse>> {
     if request.jsonrpc != "2.0" {
@@ -128,7 +150,9 @@ async fn handle_request(
             let payload = InitializeResult {
                 protocol_version: "2024-11-05",
                 capabilities: ServerCapabilities {
-                    tools: ToolsCapability {},
+                    tools: ToolsCapability {
+                        list_changed: Some(true),
+                    },
                 },
                 server_info: ServerInfo {
                     name: "ozymem-server",
@@ -157,40 +181,40 @@ async fn handle_request(
                             "additionalProperties": false
                         }),
                     },
-                ToolDefinition {
-                    name: "graph_summary",
-                    description: "Summarize the indexed graph with file and function counts.",
-                    input_schema: json!({
-                        "type": "object",
+                    ToolDefinition {
+                        name: "graph_summary",
+                        description: "Summarize the indexed graph with file and function counts.",
+                        input_schema: json!({
+                            "type": "object",
                             "properties": {},
-                        "additionalProperties": false
-                    }),
-                },
-                ToolDefinition {
-                    name: "record_lesson",
-                    description: "Record an error-to-fix lesson for a file as historical memory.",
-                    input_schema: json!({
-                        "type": "object",
-                        "properties": {
-                            "file_path": {
-                                "type": "string",
-                                "description": "Absolute path of the file that failed"
+                            "additionalProperties": false
+                        }),
+                    },
+                    ToolDefinition {
+                        name: "record_lesson",
+                        description: "Record an error-to-fix lesson for a file as historical memory.",
+                        input_schema: json!({
+                            "type": "object",
+                            "properties": {
+                                "file_path": {
+                                    "type": "string",
+                                    "description": "Absolute path of the file that failed"
+                                },
+                                "error_type": {
+                                    "type": "string",
+                                    "description": "Error category such as NativeCommandError or CompilationError"
+                                },
+                                "solution": {
+                                    "type": "string",
+                                    "description": "Short fix or lesson learned"
+                                }
                             },
-                            "error_type": {
-                                "type": "string",
-                                "description": "Error category such as NativeCommandError or CompilationError"
-                            },
-                            "solution": {
-                                "type": "string",
-                                "description": "Short fix or lesson learned"
-                            }
-                        },
-                        "required": ["file_path", "error_type", "solution"],
-                        "additionalProperties": false
-                    }),
-                },
-            ],
-        };
+                            "required": ["file_path", "error_type", "solution"],
+                            "additionalProperties": false
+                        }),
+                    },
+                ],
+            };
 
             ok_response(id, serde_json::to_value(payload)?)
         }
@@ -199,6 +223,14 @@ async fn handle_request(
                 .params
                 .ok_or_else(|| anyhow::anyhow!("missing params for tools/call"))?;
             let tool_call: ToolCallParams = serde_json::from_value(params)?;
+
+            // Establish connection lazily
+            let connection = match get_connection(connection_cell).await {
+                Ok(conn) => conn,
+                Err(e) => {
+                    return Ok(Some(error_response(id, -32603, &format!("Memgraph connection failed: {:?}", e))));
+                }
+            };
 
             let payload = match tool_call.name.as_str() {
                 "file_context" => {
@@ -272,42 +304,9 @@ fn read_string_argument(arguments: &Map<String, Value>, key: &str) -> anyhow::Re
         .ok_or_else(|| anyhow::anyhow!("missing required string argument: {key}"))
 }
 
-async fn read_request(reader: &mut BufReader<io::Stdin>) -> anyhow::Result<Option<JsonRpcRequest>> {
-    let mut content_length = None;
-
-    loop {
-        let mut line = String::new();
-        let bytes_read = reader.read_line(&mut line).await?;
-        if bytes_read == 0 {
-            return Ok(None);
-        }
-
-        let trimmed = line.trim_end_matches(['\r', '\n']);
-        if trimmed.is_empty() {
-            break;
-        }
-
-        if let Some((header, value)) = trimmed.split_once(':') {
-            if header.eq_ignore_ascii_case("content-length") {
-                content_length = Some(value.trim().parse::<usize>()?);
-            }
-        }
-    }
-
-    let length = content_length.context("missing Content-Length header")?;
-    let mut buffer = vec![0_u8; length];
-    reader.read_exact(&mut buffer).await?;
-
-    let request = serde_json::from_slice(&buffer).context("invalid JSON-RPC payload")?;
-    Ok(Some(request))
-}
-
 async fn write_response(writer: &mut io::Stdout, response: &JsonRpcResponse) -> anyhow::Result<()> {
-    let payload = serde_json::to_vec(response)?;
-    writer
-        .write_all(format!("Content-Length: {}\r\n\r\n", payload.len()).as_bytes())
-        .await?;
-    writer.write_all(&payload).await?;
+    let payload = serde_json::to_string(response)?;
+    writer.write_all(format!("{}\n", payload).as_bytes()).await?;
     writer.flush().await?;
     Ok(())
 }

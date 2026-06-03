@@ -2,7 +2,9 @@ use anyhow::Context;
 use ozymem_core::{MemgraphConnection, MemgraphConfig, default_memgraph_uri, default_memgraph_database};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use std::io::{self, BufRead, Write};
+use std::sync::Arc;
+use tokio::sync::OnceCell;
+use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -46,7 +48,10 @@ struct ServerCapabilities {
 }
 
 #[derive(Debug, Serialize)]
-struct ToolsCapability {}
+struct ToolsCapability {
+    #[serde(rename = "listChanged", skip_serializing_if = "Option::is_none")]
+    list_changed: Option<bool>,
+}
 
 #[derive(Debug, Serialize)]
 struct ServerInfo {
@@ -144,39 +149,23 @@ pub async fn run_mcp_server() -> anyhow::Result<()> {
     // Force logs to stderr to protect stdout data channel
     eprintln!("[INFO] Iniciando servidor MCP de Ozymem...");
 
-    let config = MemgraphConfig {
-        uri: std::env::var("MEMGRAPH_URI").unwrap_or_else(|_| default_memgraph_uri().to_string()),
-        user: std::env::var("MEMGRAPH_USER").unwrap_or_else(|_| "admin".to_string()),
-        password: std::env::var("MEMGRAPH_PASSWORD").unwrap_or_else(|_| "admin".to_string()),
-        database: std::env::var("MEMGRAPH_DATABASE").unwrap_or_else(|_| default_memgraph_database().to_string()),
-    };
+    let connection_cell = Arc::new(OnceCell::new());
+    let mut stdin = BufReader::new(io::stdin());
+    let mut stdout = io::stdout();
 
-    let connection = match MemgraphConnection::connect(config).await {
-        Ok(conn) => conn,
-        Err(e) => {
-            eprintln!("[ERROR] No se pudo conectar a Memgraph: {:?}", e);
-            return Err(e);
-        }
-    };
-
-    let stdin = io::stdin();
-    let mut reader = stdin.lock();
-
-    loop {
-        let mut line = String::new();
-        let bytes_read = reader.read_line(&mut line)?;
-        if bytes_read == 0 {
-            break;
-        }
-
+    let mut line = String::new();
+    while {
+        line.clear();
+        stdin.read_line(&mut line).await? > 0
+    } {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
         }
 
         if let Ok(request) = serde_json::from_str::<JsonRpcRequest>(trimmed) {
-            if let Some(response) = handle_request(&connection, request).await? {
-                write_response(&response)?;
+            if let Some(response) = handle_request(&connection_cell, request).await? {
+                write_response(&mut stdout, &response).await?;
             }
         } else {
             eprintln!("[WARNING] Recibida línea no válida para JSON-RPC: {}", trimmed);
@@ -186,8 +175,20 @@ pub async fn run_mcp_server() -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn get_connection(cell: &OnceCell<MemgraphConnection>) -> anyhow::Result<&MemgraphConnection> {
+    cell.get_or_try_init(|| async {
+        let config = MemgraphConfig {
+            uri: std::env::var("MEMGRAPH_URI").unwrap_or_else(|_| default_memgraph_uri().to_string()),
+            user: std::env::var("MEMGRAPH_USER").unwrap_or_else(|_| "admin".to_string()),
+            password: std::env::var("MEMGRAPH_PASSWORD").unwrap_or_else(|_| "admin".to_string()),
+            database: std::env::var("MEMGRAPH_DATABASE").unwrap_or_else(|_| default_memgraph_database().to_string()),
+        };
+        MemgraphConnection::connect(config).await
+    }).await
+}
+
 async fn handle_request(
-    connection: &MemgraphConnection,
+    connection_cell: &OnceCell<MemgraphConnection>,
     request: JsonRpcRequest,
 ) -> anyhow::Result<Option<JsonRpcResponse>> {
     if request.jsonrpc != "2.0" {
@@ -233,7 +234,9 @@ async fn handle_request(
             let payload = InitializeResult {
                 protocol_version: "2024-11-05",
                 capabilities: ServerCapabilities {
-                    tools: ToolsCapability {},
+                    tools: ToolsCapability {
+                        list_changed: Some(true),
+                    },
                 },
                 server_info: ServerInfo {
                     name: "ozymem-mcp",
@@ -271,6 +274,53 @@ async fn handle_request(
                             "additionalProperties": false
                         }),
                     },
+                    ToolDefinition {
+                        name: "graph_summary",
+                        description: "Summarize the indexed graph with file and function counts.",
+                        input_schema: json!({
+                            "type": "object",
+                            "properties": {},
+                            "additionalProperties": false
+                        }),
+                    },
+                    ToolDefinition {
+                        name: "file_context",
+                        description: "Return the indexed file context, including language, strategy, and functions.",
+                        input_schema: json!({
+                            "type": "object",
+                            "properties": {
+                                "file_path": {
+                                    "type": "string",
+                                    "description": "Path used when the file was indexed"
+                                }
+                            },
+                            "required": ["file_path"],
+                            "additionalProperties": false
+                        }),
+                    },
+                    ToolDefinition {
+                        name: "record_lesson",
+                        description: "Record an error-to-fix lesson for a file as historical memory.",
+                        input_schema: json!({
+                            "type": "object",
+                            "properties": {
+                                "file_path": {
+                                    "type": "string",
+                                    "description": "Absolute path of the file that failed"
+                                },
+                                "error_type": {
+                                    "type": "string",
+                                    "description": "Error category such as NativeCommandError or CompilationError"
+                                },
+                                "solution": {
+                                    "type": "string",
+                                    "description": "Short fix or lesson learned"
+                                }
+                            },
+                            "required": ["file_path", "error_type", "solution"],
+                            "additionalProperties": false
+                        }),
+                    },
                 ],
             };
 
@@ -285,6 +335,14 @@ async fn handle_request(
             let session = SESSION.lock().unwrap();
             let Some(proj_path) = &session.project_path else {
                 return Ok(Some(error_response(id, -32603, "MCP no inicializado con un proyecto válido")));
+            };
+
+            // Establish connection lazily
+            let connection = match get_connection(connection_cell).await {
+                Ok(conn) => conn,
+                Err(e) => {
+                    return Ok(Some(error_response(id, -32603, &format!("Memgraph connection failed: {:?}", e))));
+                }
             };
 
             let payload = match tool_call.name.as_str() {
@@ -354,6 +412,49 @@ async fn handle_request(
                         is_error: None,
                     }
                 }
+                "graph_summary" => {
+                    let summary = connection.get_graph_summary().await?;
+                    ToolCallResult {
+                        content: vec![ContentBlock {
+                            kind: "text",
+                            text: format_graph_summary(&summary),
+                        }],
+                        is_error: None,
+                    }
+                }
+                "file_context" => {
+                    let file_path = read_string_argument(&tool_call.arguments, "file_path")
+                        .or_else(|_| read_string_argument(&tool_call.arguments, "path"))?;
+                    let context = connection.get_file_context(&file_path).await?;
+                    let historical_engrams = connection
+                        .get_historical_engram_solutions(&file_path)
+                        .await?;
+                    let body = format_file_context(context.as_ref(), &file_path);
+                    ToolCallResult {
+                        content: vec![ContentBlock {
+                            kind: "text",
+                            text: prepend_historical_engrams(&historical_engrams, body),
+                        }],
+                        is_error: None,
+                    }
+                }
+                "record_lesson" => {
+                    let file_path = read_string_argument(&tool_call.arguments, "file_path")?;
+                    let error_type = read_string_argument(&tool_call.arguments, "error_type")?;
+                    let solution = read_string_argument(&tool_call.arguments, "solution")?;
+
+                    connection
+                        .record_lesson(&file_path, &error_type, &solution)
+                        .await?;
+
+                    ToolCallResult {
+                        content: vec![ContentBlock {
+                            kind: "text",
+                            text: format!("Recorded lesson for {file_path}"),
+                        }],
+                        is_error: None,
+                    }
+                }
                 _ => {
                     return Ok(Some(error_response(id, -32601, "Unknown tool")));
                 }
@@ -367,12 +468,66 @@ async fn handle_request(
     Ok(Some(response))
 }
 
-fn write_response(response: &JsonRpcResponse) -> anyhow::Result<()> {
+fn format_file_context(context: Option<&ozymem_core::FileGraphContext>, file_path: &str) -> String {
+    let Some(context) = context else {
+        return format!("No indexed file found for {file_path}");
+    };
+
+    let mut output = format!(
+        "File: {}\nLanguage: {}\nFunctions: {}",
+        context.file_path,
+        context.language,
+        context.functions.len()
+    );
+
+    for function in &context.functions {
+        output.push_str(&format!(
+            "\n- {} [{}] lines {}-{} via {}",
+            function.name, function.kind, function.start_line, function.end_line, function.strategy
+        ));
+    }
+
+    output
+}
+
+fn prepend_historical_engrams(history: &[String], body: String) -> String {
+    if history.is_empty() {
+        return body;
+    }
+
+    let mut output = String::from("[HISTORICAL ENGRAMS FOR THIS FILE:\n");
+    for solution in history {
+        output.push_str(&format!("- {solution}\n"));
+    }
+    output.push_str("]\n\n");
+    output.push_str(&body);
+    output
+}
+
+fn format_graph_summary(summary: &ozymem_core::GraphSummary) -> String {
+    format!(
+        "Files: {}\nFunctions: {}\nEngrams: {}\nNative AST functions: {}\nExtension WASM functions: {}\nText heuristic functions: {}",
+        summary.file_count,
+        summary.function_count,
+        summary.engram_count,
+        summary.native_ast_function_count,
+        summary.extension_wasm_function_count,
+        summary.text_heuristic_function_count
+    )
+}
+
+fn read_string_argument(arguments: &Map<String, Value>, key: &str) -> anyhow::Result<String> {
+    arguments
+        .get(key)
+        .and_then(Value::as_str)
+        .map(|value| value.to_string())
+        .ok_or_else(|| anyhow::anyhow!("missing required string argument: {key}"))
+}
+
+async fn write_response(writer: &mut io::Stdout, response: &JsonRpcResponse) -> anyhow::Result<()> {
     let payload = serde_json::to_string(response)?;
-    let stdout = io::stdout();
-    let mut handle = stdout.lock();
-    writeln!(handle, "{}", payload)?;
-    handle.flush()?;
+    writer.write_all(format!("{}\n", payload).as_bytes()).await?;
+    writer.flush().await?;
     Ok(())
 }
 
@@ -407,3 +562,4 @@ impl MemgraphConnectionExt for MemgraphConnection {
         self.graph()
     }
 }
+
