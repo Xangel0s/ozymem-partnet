@@ -93,6 +93,11 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    #[command(alias = "check")]
+    Doctor {
+        #[arg(long)]
+        json: bool,
+    },
     Scan {
         path: String,
 
@@ -194,6 +199,9 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     match &args.command {
+        Commands::Doctor { json } => {
+            return run_doctor(*json).await;
+        }
         Commands::Start { path, force } => {
             return run_start(path.clone(), *force);
         }
@@ -283,6 +291,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::List => unreachable!(),
         Commands::Init => unreachable!(),
         Commands::Mcp { .. } => unreachable!(),
+        Commands::Doctor { .. } => unreachable!(),
     }
 
     Ok(())
@@ -477,7 +486,8 @@ async fn scan_directory(
     println!("Scanning directory: {}", canonical_target.display());
 
     let mut rust_dependency_batches: Vec<RustDependencyBatch> = Vec::new();
-    let ignore_patterns = load_ignore_patterns();
+    let project_root = resolve_project_root(&canonical_target);
+    let ignore_patterns = load_ignore_patterns_for_project(&project_root);
     
     // Lista negra estricta de carpetas para evitar entrar en ellas de raíz
     const CARPETAS_EXCLUIDAS: &[&str] = &[
@@ -553,7 +563,7 @@ async fn scan_directory(
             return false;
         }
 
-        if is_ignored_by_patterns(path, &ignore_patterns) {
+        if is_ignored_by_patterns(path, &ignore_patterns, &project_root) {
             return false;
         }
 
@@ -571,7 +581,7 @@ async fn scan_directory(
             continue;
         }
 
-        if is_ignored_by_patterns(path, &ignore_patterns) {
+        if is_ignored_by_patterns(path, &ignore_patterns, &project_root) {
             continue;
         }
 
@@ -1009,6 +1019,9 @@ async fn run_watch(context: &AppContext, target_path: &str, force: bool) -> anyh
     check_directory_authorized(target_path)?;
 
     let canonical_target = canonicalize_target(target_path)?;
+    let project_root = resolve_project_root(&canonical_target);
+    let mut ignore_patterns = load_ignore_patterns_for_project(&project_root);
+
     if !force && is_critical_root(&canonical_target) {
         return Err(anyhow::anyhow!(
             "Error: No se permite indexar desde la raíz del perfil de usuario por seguridad. Muévete a la carpeta de tu proyecto."
@@ -1140,7 +1153,7 @@ async fn run_watch(context: &AppContext, target_path: &str, force: bool) -> anyh
                 let mut ignore_changed = false;
                 for path in &event.paths {
                     if let Some(filename) = path.file_name().and_then(|f| f.to_str()) {
-                        if filename == ".ozymemignore" {
+                        if filename == ".ozymemignore" || filename == ".gitignore" {
                             ignore_changed = true;
                             break;
                         }
@@ -1148,14 +1161,14 @@ async fn run_watch(context: &AppContext, target_path: &str, force: bool) -> anyh
                 }
 
                 if ignore_changed {
-                    eprintln!("[WATCHER] Detectado cambio en .ozymemignore. Sincronizando y purgando archivos ignorados del grafo...");
-                    let ignore_patterns = load_ignore_patterns();
+                    eprintln!("[WATCHER] Detectado cambio en archivos de ignore (.ozymemignore / .gitignore). Sincronizando y purgando archivos ignorados del grafo...");
+                    ignore_patterns = load_ignore_patterns_for_project(&project_root);
                     if is_connected.load(Ordering::SeqCst) {
                         match context.connection.get_all_file_paths().await {
                             Ok(all_paths) => {
                                 for file_path_str in all_paths {
                                     let path_obj = Path::new(&file_path_str);
-                                    if is_ignored_by_patterns(path_obj, &ignore_patterns) {
+                                    if is_ignored_by_patterns(path_obj, &ignore_patterns, &project_root) {
                                         if let Err(_) = context.connection.delete_file_definition(&file_path_str).await {
                                             append_to_wal(&file_path_str, ozymem_core::WalAction::Delete);
                                             trigger_reconnect(context.connection.clone(), std::sync::Arc::clone(&is_connected), std::sync::Arc::clone(&reconnecting));
@@ -1173,11 +1186,11 @@ async fn run_watch(context: &AppContext, target_path: &str, force: bool) -> anyh
                 if event.kind.is_modify() || event.kind.is_create() {
                     for path in event.paths {
                         if let Some(filename) = path.file_name().and_then(|f| f.to_str()) {
-                            if filename == ".ozymemignore" || filename == ".ozymem_wal" {
+                            if filename == ".ozymemignore" || filename == ".gitignore" || filename == ".ozymem_wal" {
                                 continue;
                             }
                         }
-                        if should_watch_path(&path) {
+                        if should_watch_path(&path, &ignore_patterns, &project_root) {
                             let absolute_path = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
                             let absolute_file_path = clean_path(&absolute_path);
                             if is_connected.load(Ordering::SeqCst) {
@@ -1196,11 +1209,11 @@ async fn run_watch(context: &AppContext, target_path: &str, force: bool) -> anyh
                 } else if event.kind.is_remove() {
                     for path in event.paths {
                         if let Some(filename) = path.file_name().and_then(|f| f.to_str()) {
-                            if filename == ".ozymemignore" || filename == ".ozymem_wal" {
+                            if filename == ".ozymemignore" || filename == ".gitignore" || filename == ".ozymem_wal" {
                                 continue;
                             }
                         }
-                        if should_process_delete(&path) {
+                        if should_process_delete(&path, &ignore_patterns, &project_root) {
                             let resolved = canonicalize_deleted_path(&path).unwrap_or_else(|| path.clone());
                             let absolute_file_path = clean_path(&resolved);
                             if is_connected.load(Ordering::SeqCst) {
@@ -1241,9 +1254,8 @@ fn canonicalize_deleted_path(path: &Path) -> Option<PathBuf> {
     Some(canonical_parent.join(file_name))
 }
 
-fn should_process_delete(path: &Path) -> bool {
-    let ignore_patterns = load_ignore_patterns();
-    if is_ignored_by_patterns(path, &ignore_patterns) {
+fn should_process_delete(path: &Path, ignore_patterns: &[String], project_root: &Path) -> bool {
+    if is_ignored_by_patterns(path, ignore_patterns, project_root) {
         return false;
     }
     if is_binary_file(path) {
@@ -1313,9 +1325,8 @@ fn should_process_delete(path: &Path) -> bool {
     true
 }
 
-fn should_watch_path(path: &Path) -> bool {
-    let ignore_patterns = load_ignore_patterns();
-    if is_ignored_by_patterns(path, &ignore_patterns) {
+fn should_watch_path(path: &Path, ignore_patterns: &[String], project_root: &Path) -> bool {
+    if is_ignored_by_patterns(path, ignore_patterns, project_root) {
         return false;
     }
     if !path.is_file() {
@@ -1428,33 +1439,61 @@ fn canonicalize_file(file_path: &str) -> anyhow::Result<PathBuf> {
     canonicalize_target(file_path)
 }
 
-fn load_ignore_patterns() -> Vec<String> {
-    if let Ok(content) = fs::read_to_string(".ozymemignore") {
-        content
-            .lines()
-            .map(|l| l.trim().to_string())
-            .filter(|l| !l.is_empty() && !l.starts_with('#'))
-            .collect()
-    } else {
-        Vec::new()
+fn resolve_project_root(target_path: &Path) -> PathBuf {
+    if let Ok((_, config)) = load_config() {
+        let clean_target_lower = clean_path(target_path).to_lowercase();
+        for (_, registered_path_str) in &config.projects {
+            if let Ok(reg_path_buf) = PathBuf::from(registered_path_str).canonicalize() {
+                let clean_reg_path_lower = clean_path(&reg_path_buf).to_lowercase();
+                if clean_target_lower == clean_reg_path_lower 
+                    || clean_target_lower.starts_with(&format!("{}\\", clean_reg_path_lower)) 
+                    || clean_target_lower.starts_with(&format!("{}/", clean_reg_path_lower)) 
+                {
+                    return reg_path_buf;
+                }
+            }
+        }
     }
+    target_path.to_path_buf()
 }
 
-fn is_ignored_by_patterns(path: &Path, patterns: &[String]) -> bool {
+fn load_ignore_patterns_for_project(project_root: &Path) -> Vec<String> {
+    let mut patterns = Vec::new();
+
+    // 1. Cargar .ozymemignore
+    let ozymemignore_path = project_root.join(".ozymemignore");
+    if let Ok(content) = fs::read_to_string(&ozymemignore_path) {
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() && !trimmed.starts_with('#') {
+                patterns.push(trimmed.to_string());
+            }
+        }
+    }
+
+    // 2. Cargar .gitignore (Manejo Dinámico)
+    let gitignore_path = project_root.join(".gitignore");
+    if let Ok(content) = fs::read_to_string(&gitignore_path) {
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() && !trimmed.starts_with('#') {
+                patterns.push(trimmed.to_string());
+            }
+        }
+    }
+
+    patterns
+}
+
+fn is_ignored_by_patterns(path: &Path, patterns: &[String], project_root: &Path) -> bool {
     if patterns.is_empty() {
         return false;
     }
     let cleaned_path_str = clean_path(path);
     let cleaned_path = Path::new(&cleaned_path_str);
 
-    let relative_path = if let Ok(current_dir) = std::env::current_dir() {
-        let cleaned_current_str = clean_path(&current_dir);
-        let cleaned_current = Path::new(&cleaned_current_str);
-        if let Ok(rel) = cleaned_path.strip_prefix(cleaned_current) {
-            rel.to_path_buf()
-        } else {
-            cleaned_path.to_path_buf()
-        }
+    let relative_path = if let Ok(rel) = cleaned_path.strip_prefix(project_root) {
+        rel.to_path_buf()
     } else {
         cleaned_path.to_path_buf()
     };
@@ -2030,6 +2069,40 @@ mod tests {
             format!("bolt://{}", default_memgraph_uri())
         );
     }
+
+    #[test]
+    fn dynamic_ignore_patterns_load_and_check() {
+        let temp_root =
+            std::env::temp_dir().join(format!("ozymem-cli-ignore-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_root);
+        fs::create_dir_all(&temp_root).expect("create temp root");
+
+        let ozymemignore_path = temp_root.join(".ozymemignore");
+        let mut ozymemignore_file = File::create(&ozymemignore_path).expect("create ozymemignore");
+        writeln!(ozymemignore_file, "pattern1").expect("write pattern1");
+        writeln!(ozymemignore_file, "# comment").expect("write comment");
+        writeln!(ozymemignore_file, "pattern2").expect("write pattern2");
+
+        let gitignore_path = temp_root.join(".gitignore");
+        let mut gitignore_file = File::create(&gitignore_path).expect("create gitignore");
+        writeln!(gitignore_file, "pattern3").expect("write pattern3");
+
+        let patterns = load_ignore_patterns_for_project(&temp_root);
+        assert_eq!(patterns.len(), 3);
+        assert!(patterns.contains(&"pattern1".to_string()));
+        assert!(patterns.contains(&"pattern2".to_string()));
+        assert!(patterns.contains(&"pattern3".to_string()));
+
+        let file1 = temp_root.join("pattern1");
+        let file2 = temp_root.join("other_file");
+        let file3 = temp_root.join("pattern3");
+
+        assert!(is_ignored_by_patterns(&file1, &patterns, &temp_root));
+        assert!(!is_ignored_by_patterns(&file2, &patterns, &temp_root));
+        assert!(is_ignored_by_patterns(&file3, &patterns, &temp_root));
+
+        let _ = fs::remove_dir_all(&temp_root);
+    }
 }
 
 fn get_project_identifier(target_path: &str) -> anyhow::Result<(String, String)> {
@@ -2525,6 +2598,176 @@ async fn run_init() -> anyhow::Result<()> {
     println!("Para auditar los registros en tiempo real, utiliza:");
     println!("  - Logs del Watcher:  ozymem logs {}", selected_project_name);
     println!("  - Logs del MCP:      ozymem logs mcp");
+
+    Ok(())
+}
+
+async fn run_doctor(json_output: bool) -> anyhow::Result<()> {
+    // 1. Config file check
+    let config_path = PathBuf::from("C:\\Users\\Lenovo\\.ozymem.toml");
+    let config_exists = config_path.exists();
+    let config_valid = if config_exists {
+        load_config().is_ok()
+    } else {
+        false
+    };
+
+    // 2. Docker Client check
+    let docker_version_output = std::process::Command::new("docker")
+        .arg("--version")
+        .output();
+    let docker_installed = docker_version_output.is_ok();
+    let docker_version = if let Ok(ref out) = docker_version_output {
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    } else {
+        String::new()
+    };
+
+    // 3. Docker Daemon check
+    let docker_info_output = std::process::Command::new("docker")
+        .arg("info")
+        .output();
+    let docker_running = docker_info_output.is_ok() && docker_info_output.as_ref().unwrap().status.success();
+
+    // 4. Memgraph containers check
+    let mut memgraph_container_running = false;
+    let mut lab_container_running = false;
+    if docker_running {
+        if let Ok(out) = std::process::Command::new("docker")
+            .args(&["ps", "--filter", "name=ozymem-memgraph", "--format", "{{.Names}}:{{.Status}}"])
+            .output()
+        {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            for line in stdout.lines() {
+                if line.contains("ozymem-memgraph-lab") {
+                    lab_container_running = line.to_lowercase().contains("up");
+                } else if line.contains("ozymem-memgraph") {
+                    memgraph_container_running = line.to_lowercase().contains("up");
+                }
+            }
+        }
+    }
+
+    // 5. Connect and ping check
+    let connection_res = build_connection().await;
+    let (db_connected, db_ping_ok) = match &connection_res {
+        Ok(conn) => {
+            let ping_res = conn.ping().await;
+            (true, ping_res.is_ok())
+        }
+        Err(_) => (false, false),
+    };
+
+    // 6. Environment variables
+    let env_uri = std::env::var("MEMGRAPH_URI");
+    let env_user = std::env::var("MEMGRAPH_USER");
+    let env_password = std::env::var("MEMGRAPH_PASSWORD");
+    let env_database = std::env::var("MEMGRAPH_DATABASE");
+
+    if json_output {
+        let payload = serde_json::json!({
+            "config_exists": config_exists,
+            "config_valid": config_valid,
+            "docker_installed": docker_installed,
+            "docker_running": docker_running,
+            "memgraph_container_running": memgraph_container_running,
+            "lab_container_running": lab_container_running,
+            "db_connected": db_connected,
+            "db_ping_ok": db_ping_ok,
+            "env_vars": {
+                "MEMGRAPH_URI": env_uri.ok(),
+                "MEMGRAPH_USER": env_user.ok(),
+                "MEMGRAPH_PASSWORD_SET": env_password.is_ok(),
+                "MEMGRAPH_DATABASE": env_database.ok(),
+            }
+        });
+        println!("{}", serde_json::to_string(&payload)?);
+        return Ok(());
+    }
+
+    println!("=========================================");
+    println!("     OZYMEM SYSTEM ENVIRONMENT DOCTOR    ");
+    println!("=========================================");
+    println!();
+
+    // Config Check
+    if config_exists && config_valid {
+        println!("  [✔] Configuración Local: Encontrada y válida (.ozymem.toml)");
+    } else if config_exists {
+        println!("  [✘] Configuración Local: Encontrada pero INVÁLIDA (.ozymem.toml)");
+    } else {
+        println!("  [✘] Configuración Local: No encontrada (.ozymem.toml no existe)");
+    }
+
+    // Docker installation
+    if docker_installed {
+        println!("  [✔] Cliente Docker: Instalado ({})", docker_version);
+    } else {
+        println!("  [✘] Cliente Docker: No detectado en el PATH");
+    }
+
+    // Docker status
+    if docker_running {
+        println!("  [✔] Docker Daemon: Activo y en ejecución");
+    } else {
+        println!("  [✘] Docker Daemon: Inactivo o inaccesible (¿está Docker abierto?)");
+    }
+
+    // Containers
+    if docker_running {
+        if memgraph_container_running {
+            println!("  [✔] Contenedor ozymem-memgraph: ACTIVO / EJECUTÁNDOSE");
+        } else {
+            println!("  [✘] Contenedor ozymem-memgraph: DETENIDO o INEXISTENTE (usa 'ozymem init' para inicializarlo)");
+        }
+
+        if lab_container_running {
+            println!("  [✔] Contenedor ozymem-memgraph-lab: ACTIVO / EJECUTÁNDOSE");
+        } else {
+            println!("  [✘] Contenedor ozymem-memgraph-lab: DETENIDO o INEXISTENTE");
+        }
+    } else {
+        println!("  [-] Contenedores de Memgraph: No se pudo verificar (Docker no se está ejecutando)");
+    }
+
+    // Memgraph connection
+    if db_ping_ok {
+        println!("  [✔] Conexión al Cerebro (Memgraph): EXITOSA (Ping respondido)");
+    } else if db_connected {
+        println!("  [✘] Conexión al Cerebro (Memgraph): Establecida pero falló el PING (¿puerto bloqueado?)");
+    } else {
+        println!("  [✘] Conexión al Cerebro (Memgraph): CONEXIÓN FALLIDA (¿está Memgraph encendido?)");
+    }
+
+    // Env vars info
+    println!();
+    println!("Variables de Entorno:");
+    println!("  - MEMGRAPH_URI:      {}", env_uri.unwrap_or_else(|_| format!("{} (Por defecto)", default_memgraph_uri())));
+    println!("  - MEMGRAPH_USER:     {}", env_user.unwrap_or_else(|_| format!("{} (Por defecto)", "admin")));
+    println!("  - MEMGRAPH_PASSWORD: {}", if env_password.is_ok() { "[ESTABLECIDA]" } else { "[POR DEFECTO]" });
+    println!("  - MEMGRAPH_DATABASE: {}", env_database.unwrap_or_else(|_| format!("{} (Por defecto)", default_memgraph_database())));
+    println!();
+
+    // Recommendation/Summary
+    let healthy = config_valid && docker_running && memgraph_container_running && db_ping_ok;
+    if healthy {
+        println!("¡ENHORABUENA! Tu entorno de Ozymem está en perfectas condiciones.");
+    } else {
+        println!("ADVERTENCIA: Se han detectado problemas en el entorno.");
+        println!("Soluciones sugeridas:");
+        if !config_exists {
+            println!("  -> Ejecuta un comando básico de ozymem o crea el archivo .ozymem.toml en tu perfil.");
+        }
+        if !docker_running {
+            println!("  -> Asegúrate de que la aplicación Docker Desktop o el servicio Docker esté iniciado.");
+        } else if !memgraph_container_running {
+            println!("  -> Ejecuta 'ozymem init' para arrancar los contenedores del ecosistema.");
+        }
+        if !db_ping_ok && memgraph_container_running {
+            println!("  -> Verifica que el puerto 7687 no esté ocupado por otra base de datos.");
+        }
+    }
+    println!("=========================================");
 
     Ok(())
 }
