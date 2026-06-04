@@ -207,7 +207,7 @@ async fn main() -> anyhow::Result<()> {
             return run_register(name.clone());
         }
         Commands::Deregister { name } => {
-            return run_deregister(name.clone());
+            return run_deregister(name.clone()).await;
         }
         Commands::List => {
             return run_list();
@@ -1685,7 +1685,7 @@ fn run_register(name_arg: Option<String>) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_deregister(name_arg: Option<String>) -> anyhow::Result<()> {
+async fn run_deregister(name_arg: Option<String>) -> anyhow::Result<()> {
     let (config_path, mut config) = load_config()?;
     if config.projects.is_empty() {
         println!("[INFO] No hay proyectos registrados todavía.");
@@ -1746,6 +1746,8 @@ fn run_deregister(name_arg: Option<String>) -> anyhow::Result<()> {
         return Err(anyhow::anyhow!("El proyecto '{}' no está registrado.", project_name));
     }
 
+    let project_path = config.projects.get(&project_name).cloned();
+
     let home_dir = home::home_dir().unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
     let pid_file = home_dir.join(format!(".ozymem-{}.pid", project_name));
     if pid_file.exists() {
@@ -1776,7 +1778,30 @@ fn run_deregister(name_arg: Option<String>) -> anyhow::Result<()> {
             let _ = std::fs::remove_file(log_file);
         }
         
-        println!("[SUCCESS] Registro del proyecto '{}' eliminado correctamente.", project_name);
+        println!("[SUCCESS] Registro del proyecto '{}' eliminado de ozymem.toml.", project_name);
+
+        if let Some(ref path_str) = project_path {
+            if let Ok(conn) = build_connection().await {
+                if conn.ping().await.is_ok() {
+                    use dialoguer::Confirm;
+                    if Confirm::with_theme(&dialoguer::theme::ColorfulTheme::default())
+                        .with_prompt("¿Desea eliminar también todos los archivos indexados de este proyecto del grafo en Memgraph?")
+                        .default(true)
+                        .interact()?
+                    {
+                        println!("[Core] Eliminando archivos del proyecto del grafo...");
+                        match conn.delete_project_files(path_str).await {
+                            Ok(deleted) => {
+                                println!("[SUCCESS] Se eliminaron {} archivos y sus funciones asociadas del grafo.", deleted);
+                            }
+                            Err(e) => {
+                                eprintln!("[ERROR] No se pudieron eliminar los archivos del grafo: {:?}", e);
+                            }
+                        }
+                    }
+                }
+            }
+        }
     } else {
         println!("Operación cancelada.");
     }

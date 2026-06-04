@@ -194,6 +194,37 @@ impl MemgraphConnection {
         Ok(true)
     }
 
+    pub async fn delete_project_files(&self, project_path: &str) -> anyhow::Result<i64> {
+        let dir_path_slash = format!("{}\\", project_path);
+        let dir_path_slash_alt = format!("{}/", project_path);
+
+        let count_query = query(
+            "MATCH (f:File) WHERE f.path = $path OR f.path STARTS WITH $slash1 OR f.path STARTS WITH $slash2 RETURN count(f) AS file_count"
+        )
+        .param("path", project_path)
+        .param("slash1", dir_path_slash.as_str())
+        .param("slash2", dir_path_slash_alt.as_str());
+
+        let mut count_result = self.graph.execute(count_query).await?;
+        let file_count = if let Some(row) = count_result.next().await? {
+            row.get::<i64>("file_count")?
+        } else {
+            0
+        };
+
+        if file_count > 0 {
+            let delete_query = query(
+                "MATCH (f:File) WHERE f.path = $path OR f.path STARTS WITH $slash1 OR f.path STARTS WITH $slash2\nOPTIONAL MATCH (f)-[:CONTAINS]->(fn:Function)\nDETACH DELETE f, fn"
+            )
+            .param("path", project_path)
+            .param("slash1", dir_path_slash.as_str())
+            .param("slash2", dir_path_slash_alt.as_str());
+            self.graph.run(delete_query).await?;
+        }
+
+        Ok(file_count)
+    }
+
     pub async fn get_all_file_paths(&self) -> anyhow::Result<Vec<String>> {
         let mut result = self
             .graph
