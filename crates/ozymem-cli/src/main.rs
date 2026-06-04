@@ -698,12 +698,12 @@ async fn print_tree(
     depth: u32,
 ) -> anyhow::Result<()> {
     let absolute_path = canonicalize_file(file_path)?;
-    let absolute_path_text = absolute_path.to_string_lossy().to_string();
+    let absolute_path_text = clean_path(&absolute_path);
     let mut visited = HashSet::new();
 
     let tree = load_tree_node(connection, &absolute_path_text, depth, &mut visited).await?;
     if tree.context.is_none() {
-        println!("No indexed file found for {}", absolute_path.display());
+        println!("No indexed file found for {}", absolute_path_text);
         return Ok(());
     }
 
