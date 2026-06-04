@@ -364,7 +364,7 @@ async fn handle_request(
                     },
                     ToolDefinition {
                         name: "record_lesson",
-                        description: "Record an error-to-fix lesson for a file as historical memory.",
+                        description: "Record an error-to-fix lesson for a file or symbol as historical memory.",
                         input_schema: json!({
                             "type": "object",
                             "properties": {
@@ -372,16 +372,20 @@ async fn handle_request(
                                     "type": "string",
                                     "description": "Absolute path of the file that failed"
                                 },
-                                "error_type": {
+                                "symbol_name": {
                                     "type": "string",
-                                    "description": "Error category such as NativeCommandError or CompilationError"
+                                    "description": "Optional name of the class or function where the error occurred"
+                                },
+                                "error_context": {
+                                    "type": "string",
+                                    "description": "Details about the error context or compilation message"
                                 },
                                 "solution": {
                                     "type": "string",
                                     "description": "Short fix or lesson learned"
                                 }
                             },
-                            "required": ["file_path", "error_type", "solution"],
+                            "required": ["file_path", "error_context", "solution"],
                             "additionalProperties": false
                         }),
                     },
@@ -504,17 +508,22 @@ async fn handle_request(
                 }
                 "record_lesson" => {
                     let file_path = read_string_argument(&tool_call.arguments, "file_path")?;
-                    let error_type = read_string_argument(&tool_call.arguments, "error_type")?;
+                    let symbol_name = tool_call.arguments.get("symbol_name")
+                        .and_then(Value::as_str);
+                    let error_context = read_string_argument(&tool_call.arguments, "error_context")?;
                     let solution = read_string_argument(&tool_call.arguments, "solution")?;
 
                     connection
-                        .record_lesson(&file_path, &error_type, &solution)
+                        .record_lesson(&file_path, symbol_name, &error_context, &solution)
                         .await?;
 
                     ToolCallResult {
                         content: vec![ContentBlock {
                             kind: "text",
-                            text: format!("Recorded lesson for {file_path}"),
+                            text: format!(
+                                "Recorded lesson for {file_path}{}",
+                                symbol_name.map(|s| format!("::{}", s)).unwrap_or_default()
+                            ),
                         }],
                         is_error: None,
                     }

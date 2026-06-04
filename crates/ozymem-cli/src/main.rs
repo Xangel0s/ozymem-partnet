@@ -1021,7 +1021,7 @@ async fn run_watch(context: &AppContext, target_path: &str, force: bool) -> anyh
     }
 
     // 2. Escaneo inicial de consistencia
-    println!("Iniciando escaneo rápido de consistencia...");
+    eprintln!("[WATCHER] Iniciando escaneo rápido de consistencia...");
     if let Err(e) = scan_directory(&context.connection, target_path, false, force).await {
         eprintln!("Advertencia en escaneo inicial: {e}");
     }
@@ -1131,7 +1131,7 @@ async fn run_watch(context: &AppContext, target_path: &str, force: bool) -> anyh
 
     use notify::Watcher;
     watcher.watch(Path::new(target_path), notify::RecursiveMode::Recursive)?;
-    println!("[Watcher] Vigilando cambios reactivamente en: {}...", target_path);
+    eprintln!("[WATCHER] Vigilando cambios reactivamente en: {}...", target_path);
 
     // 4. Bucle reactivo de eventos
     for res in rx {
@@ -1148,7 +1148,7 @@ async fn run_watch(context: &AppContext, target_path: &str, force: bool) -> anyh
                 }
 
                 if ignore_changed {
-                    println!("[Watcher] Detectado cambio en .ozymemignore. Sincronizando y purgando archivos ignorados del grafo...");
+                    eprintln!("[WATCHER] Detectado cambio en .ozymemignore. Sincronizando y purgando archivos ignorados del grafo...");
                     let ignore_patterns = load_ignore_patterns();
                     if is_connected.load(Ordering::SeqCst) {
                         match context.connection.get_all_file_paths().await {
@@ -1181,14 +1181,14 @@ async fn run_watch(context: &AppContext, target_path: &str, force: bool) -> anyh
                             let absolute_path = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
                             let absolute_file_path = clean_path(&absolute_path);
                             if is_connected.load(Ordering::SeqCst) {
-                                println!("[Watcher] Detectado cambio en: {}. Actualizando grafo...", path.display());
+                                eprintln!("[WATCHER] Re-indexando incrementalmente: {}", path.display());
                                 if let Err(e) = index_single_file(&context.connection, &path).await {
                                     eprintln!("Error al indexar archivo {}: {:?}", path.display(), e);
                                     append_to_wal(&absolute_file_path, ozymem_core::WalAction::Upsert);
                                     trigger_reconnect(context.connection.clone(), std::sync::Arc::clone(&is_connected), std::sync::Arc::clone(&reconnecting));
                                 }
                             } else {
-                                println!("[WAL APPEND] Guardado en bitácora -> [Upsert] {}", absolute_file_path);
+                                eprintln!("[WATCHER] [WAL APPEND] Guardado en bitácora -> [Upsert] {}", absolute_file_path);
                                 append_to_wal(&absolute_file_path, ozymem_core::WalAction::Upsert);
                             }
                         }
@@ -1204,14 +1204,14 @@ async fn run_watch(context: &AppContext, target_path: &str, force: bool) -> anyh
                             let resolved = canonicalize_deleted_path(&path).unwrap_or_else(|| path.clone());
                             let absolute_file_path = clean_path(&resolved);
                             if is_connected.load(Ordering::SeqCst) {
-                                println!("[Watcher] Detectada eliminación de: {}. Limpiando grafo...", absolute_file_path);
+                                eprintln!("[WATCHER] Detectada eliminación de: {}. Limpiando grafo...", absolute_file_path);
                                 if let Err(e) = context.connection.delete_file_definition(&absolute_file_path).await {
                                     eprintln!("Error al limpiar archivo {}: {:?}", absolute_file_path, e);
                                     append_to_wal(&absolute_file_path, ozymem_core::WalAction::Delete);
                                     trigger_reconnect(context.connection.clone(), std::sync::Arc::clone(&is_connected), std::sync::Arc::clone(&reconnecting));
                                 }
                             } else {
-                                println!("[WAL APPEND] Guardado en bitácora -> [Delete] {}", absolute_file_path);
+                                eprintln!("[WATCHER] [WAL APPEND] Guardado en bitácora -> [Delete] {}", absolute_file_path);
                                 append_to_wal(&absolute_file_path, ozymem_core::WalAction::Delete);
                             }
                         }
@@ -1406,6 +1406,7 @@ async fn index_single_file(connection: &MemgraphConnection, path: &Path) -> anyh
     };
 
     let map = parse_source(&absolute_file_path, language, &source_code)?;
+    let _ = connection.clear_file_symbols_and_dependencies(&absolute_file_path).await;
     connection.save_file_definition(&map).await?;
 
     if matches!(language, SupportedLanguage::Rust) {
