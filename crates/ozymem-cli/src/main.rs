@@ -142,6 +142,10 @@ enum Commands {
     Register {
         name: Option<String>,
     },
+    #[command(alias = "unregister", alias = "remove")]
+    Deregister {
+        name: Option<String>,
+    },
     #[command(alias = "projects")]
     List,
     Init,
@@ -201,6 +205,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Register { name } => {
             return run_register(name.clone());
+        }
+        Commands::Deregister { name } => {
+            return run_deregister(name.clone());
         }
         Commands::List => {
             return run_list();
@@ -272,6 +279,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Stop { .. } => unreachable!(),
         Commands::Logs { .. } => unreachable!(),
         Commands::Register { .. } => unreachable!(),
+        Commands::Deregister { .. } => unreachable!(),
         Commands::List => unreachable!(),
         Commands::Init => unreachable!(),
         Commands::Mcp { .. } => unreachable!(),
@@ -1674,6 +1682,105 @@ fn run_register(name_arg: Option<String>) -> anyhow::Result<()> {
     save_config(&config_path, &config)?;
 
     println!("[SUCCESS] Proyecto '{}' registrado en {}", name, cleaned_path);
+    Ok(())
+}
+
+fn run_deregister(name_arg: Option<String>) -> anyhow::Result<()> {
+    let (config_path, mut config) = load_config()?;
+    if config.projects.is_empty() {
+        println!("[INFO] No hay proyectos registrados todavía.");
+        return Ok(());
+    }
+
+    let project_name = match name_arg {
+        Some(p) => p,
+        None => {
+            let current_dir = std::env::current_dir()?;
+            let cleaned_curr = clean_path(&current_dir.canonicalize()?);
+            let mut found_name = None;
+            for (name, registered_path_str) in &config.projects {
+                if let Ok(reg_path_buf) = PathBuf::from(registered_path_str).canonicalize() {
+                    if clean_path(&reg_path_buf) == cleaned_curr {
+                        found_name = Some(name.clone());
+                        break;
+                    }
+                }
+            }
+            
+            match found_name {
+                Some(name) => {
+                    use dialoguer::Confirm;
+                    if Confirm::with_theme(&dialoguer::theme::ColorfulTheme::default())
+                        .with_prompt(format!("¿Desea desregistrar el proyecto '{}' del directorio actual?", name))
+                        .default(true)
+                        .interact()?
+                    {
+                        name
+                    } else {
+                        println!("Operación cancelada.");
+                        return Ok(());
+                    }
+                }
+                None => {
+                    let mut project_names: Vec<String> = config.projects.keys().cloned().collect();
+                    project_names.sort();
+                    use dialoguer::{theme::ColorfulTheme, Select};
+                    let selection = Select::with_theme(&ColorfulTheme::default())
+                        .with_prompt("Seleccione el proyecto que desea desregistrar")
+                        .items(&project_names)
+                        .default(0)
+                        .interact_opt()?;
+                    match selection {
+                        Some(idx) => project_names[idx].clone(),
+                        None => {
+                            println!("Operación cancelada.");
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    if !config.projects.contains_key(&project_name) {
+        return Err(anyhow::anyhow!("El proyecto '{}' no está registrado.", project_name));
+    }
+
+    let home_dir = home::home_dir().unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    let pid_file = home_dir.join(format!(".ozymem-{}.pid", project_name));
+    if pid_file.exists() {
+        use dialoguer::Confirm;
+        if Confirm::with_theme(&dialoguer::theme::ColorfulTheme::default())
+            .with_prompt(format!("El watcher para '{}' está activo. ¿Desea detenerlo automáticamente antes de desregistrar?", project_name))
+            .default(true)
+            .interact()?
+        {
+            let _ = run_stop(Some(project_name.clone()));
+        } else {
+            println!("Operación abortada por seguridad (el watcher sigue activo).");
+            return Ok(());
+        }
+    }
+
+    use dialoguer::Confirm;
+    if Confirm::with_theme(&dialoguer::theme::ColorfulTheme::default())
+        .with_prompt(format!("¿Está seguro de que desea eliminar el registro de '{}'?", project_name))
+        .default(false)
+        .interact()?
+    {
+        config.projects.remove(&project_name);
+        save_config(&config_path, &config)?;
+        
+        let log_file = home_dir.join(format!(".ozymem-{}.log", project_name));
+        if log_file.exists() {
+            let _ = std::fs::remove_file(log_file);
+        }
+        
+        println!("[SUCCESS] Registro del proyecto '{}' eliminado correctamente.", project_name);
+    } else {
+        println!("Operación cancelada.");
+    }
+
     Ok(())
 }
 
