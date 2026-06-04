@@ -150,7 +150,8 @@ impl MemgraphConnection {
     pub async fn record_lesson(
         &self,
         file_path: &str,
-        error_type: &str,
+        symbol_name: Option<&str>,
+        error_context: &str,
         solution: &str,
     ) -> anyhow::Result<()> {
         let timestamp = SystemTime::now()
@@ -160,14 +161,44 @@ impl MemgraphConnection {
             .to_string();
 
         let lesson_query = query(
-            "MERGE (f:File {path: $file_path})\nMERGE (e:ErrorLog {message: $error_type, type: $error_type})\nMERGE (eng:Engram {solution: $solution, timestamp: $timestamp})\nMERGE (f)-[:TRIGGERED]->(e)\nMERGE (e)-[:RESOLVED_BY]->(eng)",
+            "MERGE (f:File {path: $file_path})\n\
+             WITH f\n\
+             OPTIONAL MATCH (f)-[:CONTAINS]->(fn:Function {name: $symbol_name})\n\
+             WITH f, fn\n\
+             CREATE (l:Lesson {error_context: $error_context, solution: $solution, timestamp: $timestamp, symbol_name: coalesce($symbol_name, '')})\n\
+             CREATE (e:ErrorLog {message: $error_context, type: $error_context})\n\
+             CREATE (eng:Engram {solution: $solution, timestamp: $timestamp})\n\
+             CREATE (e)-[:RESOLVED_BY]->(eng)\n\
+             CREATE (f)-[:TRIGGERED]->(e)\n\
+             WITH f, fn, l\n\
+             FOREACH (x IN CASE WHEN fn IS NOT NULL THEN [fn] ELSE [] END |\n\
+                 CREATE (x)-[:LESSON_OF]->(l)\n\
+                 CREATE (l)-[:RESOLVED_WITH]->(x)\n\
+             )\n\
+             FOREACH (x IN CASE WHEN fn IS NULL THEN [f] ELSE [] END |\n\
+                 CREATE (x)-[:LESSON_OF]->(l)\n\
+                 CREATE (l)-[:RESOLVED_WITH]->(x)\n\
+             )"
         )
         .param("file_path", file_path)
-        .param("error_type", error_type)
+        .param("symbol_name", symbol_name.unwrap_or(""))
+        .param("error_context", error_context)
         .param("solution", solution)
         .param("timestamp", timestamp);
 
         self.graph.run(lesson_query).await?;
+        Ok(())
+    }
+
+    pub async fn clear_file_symbols_and_dependencies(&self, file_path: &str) -> anyhow::Result<()> {
+        let delete_query = query(
+            "MATCH (f:File {path: $path})\n\
+             OPTIONAL MATCH (f)-[r:DEPENDS_ON]->()\n\
+             OPTIONAL MATCH (f)-[:CONTAINS]->(fn:Function)\n\
+             DETACH DELETE r, fn"
+        )
+        .param("path", file_path);
+        self.graph.run(delete_query).await?;
         Ok(())
     }
 
