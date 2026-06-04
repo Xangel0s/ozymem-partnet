@@ -217,6 +217,21 @@ async fn handle_request(
                             "additionalProperties": false
                         }),
                     },
+                    ToolDefinition {
+                        name: "file_trace",
+                        description: "Trace incoming/reverse dependencies of an indexed file (impact analysis / who depends on this file).",
+                        input_schema: json!({
+                            "type": "object",
+                            "properties": {
+                                "file_path": {
+                                    "type": "string",
+                                    "description": "Path of the file to trace reverse dependencies for"
+                                }
+                            },
+                            "required": ["file_path"],
+                            "additionalProperties": false
+                        }),
+                    },
                 ],
             };
 
@@ -281,6 +296,26 @@ async fn handle_request(
                                 "Recorded lesson for {file_path}{}",
                                 symbol_name.map(|s| format!("::{}", s)).unwrap_or_default()
                             ),
+                        }],
+                        is_error: None,
+                    }
+                }
+                "file_trace" => {
+                    let file_path = read_string_argument(&tool_call.arguments, "file_path")
+                        .or_else(|_| read_string_argument(&tool_call.arguments, "path"))?;
+                    let incoming = connection.get_incoming_dependencies(&file_path).await?;
+                    let mut text = format!("Reverse dependencies (files impacted by changes to {}):\n", file_path);
+                    if incoming.is_empty() {
+                        text.push_str("- (none)");
+                    } else {
+                        for path in incoming {
+                            text.push_str(&format!("- {path}\n"));
+                        }
+                    }
+                    ToolCallResult {
+                        content: vec![ContentBlock {
+                            kind: "text",
+                            text,
                         }],
                         is_error: None,
                     }

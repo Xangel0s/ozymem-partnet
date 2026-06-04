@@ -120,6 +120,12 @@ enum Commands {
         #[arg(long, default_value_t = 2)]
         depth: u32,
     },
+    Trace {
+        file_path: String,
+
+        #[arg(long, default_value_t = 2)]
+        depth: u32,
+    },
     Update,
     Ignore,
     Clean {
@@ -255,6 +261,9 @@ async fn main() -> anyhow::Result<()> {
         Commands::Lessons { limit, file } => print_lessons(&context.connection, limit, file).await?,
         Commands::Tree { file_path, depth } => {
             print_tree(&context.connection, &file_path, depth).await?
+        }
+        Commands::Trace { file_path, depth } => {
+            print_trace(&context.connection, &file_path, depth).await?
         }
         Commands::Update => run_update().await?,
         Commands::Ignore => run_ignore().await?,
@@ -876,6 +885,168 @@ fn render_tree_node(node: &TreeNode, prefix: &str, is_last: bool, is_root: bool)
         render_tree_node(
             dependency,
             &dependency_prefix,
+            index + 1 == node.dependencies.len(),
+            false,
+        );
+    }
+}
+
+async fn print_trace(
+    connection: &MemgraphConnection,
+    file_path: &str,
+    depth: u32,
+) -> anyhow::Result<()> {
+    let absolute_path = canonicalize_file(file_path)?;
+    let absolute_path_text = clean_path(&absolute_path);
+    let mut visited = HashSet::new();
+
+    let trace = load_trace_node(connection, &absolute_path_text, depth, &mut visited).await?;
+    if trace.context.is_none() {
+        println!("No indexed file found for {}", absolute_path_text);
+        return Ok(());
+    }
+
+    render_trace_node(&trace, "", true, true);
+    Ok(())
+}
+
+fn load_trace_node<'a>(
+    connection: &'a MemgraphConnection,
+    file_path: &'a str,
+    remaining_depth: u32,
+    visited: &'a mut HashSet<String>,
+) -> Pin<Box<dyn Future<Output = anyhow::Result<TreeNode>> + 'a>> {
+    Box::pin(async move {
+        let context = connection.get_file_context(file_path).await?;
+        let functions = context
+            .as_ref()
+            .map(|context| context.functions.clone())
+            .unwrap_or_default();
+        let incoming = connection.get_incoming_dependencies(file_path).await?;
+
+        let cyclic = !visited.insert(file_path.to_string());
+        let truncated = remaining_depth == 0 && !incoming.is_empty();
+
+        let mut rendered_incoming = Vec::new();
+        if !cyclic && remaining_depth > 0 {
+            for dependent in incoming {
+                let child_context = connection.get_file_context(&dependent).await?;
+                let child_cyclic = visited.contains(&dependent);
+
+                if child_cyclic {
+                    rendered_incoming.push(TreeNode {
+                        path: dependent,
+                        context: child_context,
+                        functions: Vec::new(),
+                        dependencies: Vec::new(),
+                        truncated: false,
+                        cyclic: true,
+                      });
+                      continue;
+                }
+
+                rendered_incoming.push(
+                    load_trace_node(connection, &dependent, remaining_depth - 1, visited).await?,
+                );
+            }
+        }
+
+        Ok(TreeNode {
+            path: file_path.to_string(),
+            context,
+            functions,
+            dependencies: rendered_incoming,
+            truncated,
+            cyclic,
+        })
+    })
+}
+
+fn render_trace_node(node: &TreeNode, prefix: &str, is_last: bool, is_root: bool) {
+    if !is_root && node.cyclic {
+        let branch = if is_last { "└──" } else { "├──" };
+        println!("{}{} [IMPACTED_BY] File: {} (already listed)", prefix, branch, node.path);
+        return;
+    }
+
+    if is_root {
+        println!("File: {} (Target)", node.path);
+    } else {
+        let branch = if is_last { "└──" } else { "├──" };
+        println!("{}{} [IMPACTED_BY] File: {}", prefix, branch, node.path);
+    }
+
+    let next_prefix = if is_root {
+        String::new()
+    } else if is_last {
+        format!("{prefix}    ")
+    } else {
+        format!("{prefix}│   ")
+    };
+
+    let has_incoming = !node.dependencies.is_empty() || node.truncated;
+    let functions_branch = if has_incoming {
+        "├──"
+    } else {
+        "└──"
+    };
+    println!("{}{} Functions", next_prefix, functions_branch);
+
+    if node.functions.is_empty() {
+        let leaf_prefix = if has_incoming {
+            format!("{next_prefix}│   ")
+        } else {
+            format!("{next_prefix}    ")
+        };
+        println!("{}└── (none)", leaf_prefix);
+    } else {
+        let function_prefix = if has_incoming {
+            format!("{next_prefix}│   ")
+        } else {
+            format!("{next_prefix}    ")
+        };
+
+        for (index, function) in node.functions.iter().enumerate() {
+            let branch = if index + 1 == node.functions.len() {
+                "└──"
+            } else {
+                "├──"
+            };
+            println!(
+                "{}{} [MEMBER: {}] {} (lines {}-{}) via {}",
+                function_prefix,
+                branch,
+                function.kind.to_uppercase(),
+                function.name,
+                function.start_line,
+                function.end_line,
+                function.strategy
+            );
+        }
+    }
+
+    println!("{}└── Incoming Dependencies", next_prefix);
+
+    let incoming_prefix = format!("{next_prefix}    ");
+    if node.cyclic {
+        println!("{}└── (cycle)", incoming_prefix);
+        return;
+    }
+
+    if node.truncated {
+        println!("{}└── (depth limit reached)", incoming_prefix);
+        return;
+    }
+
+    if node.dependencies.is_empty() {
+        println!("{}└── (none)", incoming_prefix);
+        return;
+    }
+
+    for (index, dependent) in node.dependencies.iter().enumerate() {
+        render_trace_node(
+            dependent,
+            &incoming_prefix,
             index + 1 == node.dependencies.len(),
             false,
         );
@@ -2102,6 +2273,27 @@ mod tests {
         assert!(is_ignored_by_patterns(&file3, &patterns, &temp_root));
 
         let _ = fs::remove_dir_all(&temp_root);
+    }
+
+    #[test]
+    fn render_trace_node_handles_cycles() {
+        let node = TreeNode {
+            path: "target.rs".to_string(),
+            context: None,
+            functions: Vec::new(),
+            dependencies: vec![TreeNode {
+                path: "dependent.rs".to_string(),
+                context: None,
+                functions: Vec::new(),
+                dependencies: Vec::new(),
+                truncated: false,
+                cyclic: true,
+            }],
+            truncated: false,
+            cyclic: false,
+        };
+        render_trace_node(&node, "", true, true);
+        assert!(true);
     }
 }
 

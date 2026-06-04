@@ -495,6 +495,28 @@ impl MemgraphConnection {
             memory_usage,
         })
     }
+
+    pub async fn get_incoming_dependencies(&self, file_path: &str) -> anyhow::Result<Vec<String>> {
+        let mut result = self
+            .graph
+            .execute(
+                query(
+                    "MATCH (dep:File)-[:DEPENDS_ON]->(f:File {path: $path})\nRETURN DISTINCT dep.path AS path\nORDER BY path",
+                )
+                .param("path", file_path),
+            )
+            .await?;
+
+        let mut dependencies = Vec::new();
+        while let Some(row) = result.next().await? {
+            let path: String = row.get("path")?;
+            if !path.trim().is_empty() {
+                dependencies.push(path);
+            }
+        }
+
+        Ok(dependencies)
+    }
 }
 
 pub fn default_memgraph_uri() -> &'static str {
