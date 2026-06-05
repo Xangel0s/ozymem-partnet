@@ -6,7 +6,7 @@ use ozymem_core::{
 };
 use ozymem_parser::{
     extract_dependency_hints, is_binary_file, is_internal_dependency_hint, parse_source,
-    resolve_dependency_target, ParsedDependencyHint, SupportedLanguage,
+    resolve_dependency_target, ParsedDependencyHint, SupportedLanguage, FileDefinitionMap,
 };
 use serde::{Serialize, Deserialize};
 use std::collections::HashSet;
@@ -165,6 +165,14 @@ enum Commands {
         #[command(subcommand)]
         subcommand: McpSubcommand,
     },
+    Team {
+        #[command(subcommand)]
+        subcommand: TeamSubcommand,
+    },
+    Gpr {
+        #[command(subcommand)]
+        subcommand: GprSubcommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -173,6 +181,32 @@ pub enum McpSubcommand {
     Setup,
     Start,
     Stop,
+    Install,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum TeamSubcommand {
+    Create {
+        #[arg(long)]
+        user: String,
+        #[arg(long)]
+        role: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum GprSubcommand {
+    Push {
+        #[arg(long)]
+        message: String,
+    },
+    List,
+    Diff {
+        gpr_id: i64,
+    },
+    Merge {
+        gpr_id: i64,
+    },
 }
 
 #[derive(Clone)]
@@ -191,6 +225,29 @@ pub struct BackendClient {
 }
 
 impl BackendClient {
+    pub fn tenant_id(&self) -> String {
+        let token = match &self.mode {
+            BackendMode::Local(_) => {
+                std::env::var("OZYBASE_MCP_TOKEN")
+                    .ok()
+                    .or_else(|| {
+                        let (_, cfg) = load_config().ok()?;
+                        cfg.token
+                    })
+                    .unwrap_or_else(|| "ozys_8f7e_8f7e50d578a699177eba16c7".to_string())
+            }
+            BackendMode::Remote { token, .. } => token.clone(),
+        };
+
+        if token.starts_with("ozy_partner_ctx_") && token.contains("_usr_") {
+            let trimmed = &token["ozy_partner_ctx_".len()..];
+            let parts: Vec<&str> = trimmed.split("_usr_").collect();
+            parts[0].to_string()
+        } else {
+            "local".to_string()
+        }
+    }
+
     pub fn display_uri(&self) -> String {
         match &self.mode {
             BackendMode::Local(_) => {
@@ -224,7 +281,7 @@ impl BackendClient {
 
     pub async fn clear_graph(&self) -> anyhow::Result<()> {
         match &self.mode {
-            BackendMode::Local(conn) => conn.clear_graph().await,
+            BackendMode::Local(conn) => conn.clear_graph(&self.tenant_id()).await,
             BackendMode::Remote { url, token, client } => {
                 let resp = client.post(format!("{}/api/clear", url))
                     .header("Authorization", format!("Bearer {}", token))
@@ -241,7 +298,7 @@ impl BackendClient {
 
     pub async fn save_file_definition(&self, file_map: &ozymem_parser::FileDefinitionMap) -> anyhow::Result<()> {
         match &self.mode {
-            BackendMode::Local(conn) => conn.save_file_definition(file_map).await,
+            BackendMode::Local(conn) => conn.save_file_definition(&self.tenant_id(), file_map).await,
             BackendMode::Remote { url, token, client } => {
                 let resp = client.post(format!("{}/api/file-definition", url))
                     .header("Authorization", format!("Bearer {}", token))
@@ -259,7 +316,7 @@ impl BackendClient {
 
     pub async fn save_dependency_relation(&self, origin_path: &str, destination_path: &str) -> anyhow::Result<()> {
         match &self.mode {
-            BackendMode::Local(conn) => conn.save_dependency_relation(origin_path, destination_path).await,
+            BackendMode::Local(conn) => conn.save_dependency_relation(&self.tenant_id(), origin_path, destination_path).await,
             BackendMode::Remote { url, token, client } => {
                 let resp = client.post(format!("{}/api/dependency-relation", url))
                     .header("Authorization", format!("Bearer {}", token))
@@ -280,7 +337,7 @@ impl BackendClient {
 
     pub async fn record_lesson(&self, file_path: &str, symbol_name: Option<&str>, error_context: &str, solution: &str) -> anyhow::Result<()> {
         match &self.mode {
-            BackendMode::Local(conn) => conn.record_lesson(file_path, symbol_name, error_context, solution).await,
+            BackendMode::Local(conn) => conn.record_lesson(&self.tenant_id(), file_path, symbol_name, error_context, solution).await,
             BackendMode::Remote { url, token, client } => {
                 let resp = client.post(format!("{}/api/lesson", url))
                     .header("Authorization", format!("Bearer {}", token))
@@ -303,7 +360,7 @@ impl BackendClient {
 
     pub async fn clear_file_symbols_and_dependencies(&self, file_path: &str) -> anyhow::Result<()> {
         match &self.mode {
-            BackendMode::Local(conn) => conn.clear_file_symbols_and_dependencies(file_path).await,
+            BackendMode::Local(conn) => conn.clear_file_symbols_and_dependencies(&self.tenant_id(), file_path).await,
             BackendMode::Remote { url, token, client } => {
                 let resp = client.post(format!("{}/api/clear-file-symbols", url))
                     .header("Authorization", format!("Bearer {}", token))
@@ -321,7 +378,7 @@ impl BackendClient {
 
     pub async fn delete_file_definition(&self, file_path: &str) -> anyhow::Result<bool> {
         match &self.mode {
-            BackendMode::Local(conn) => conn.delete_file_definition(file_path).await,
+            BackendMode::Local(conn) => conn.delete_file_definition(&self.tenant_id(), file_path).await,
             BackendMode::Remote { url, token, client } => {
                 let resp = client.post(format!("{}/api/delete-file", url))
                     .header("Authorization", format!("Bearer {}", token))
@@ -340,7 +397,7 @@ impl BackendClient {
 
     pub async fn delete_project_files(&self, project_path: &str) -> anyhow::Result<i64> {
         match &self.mode {
-            BackendMode::Local(conn) => conn.delete_project_files(project_path).await,
+            BackendMode::Local(conn) => conn.delete_project_files(&self.tenant_id(), project_path).await,
             BackendMode::Remote { url, token, client } => {
                 let resp = client.post(format!("{}/api/delete-project-files", url))
                     .header("Authorization", format!("Bearer {}", token))
@@ -359,7 +416,7 @@ impl BackendClient {
 
     pub async fn get_all_file_paths(&self) -> anyhow::Result<Vec<String>> {
         match &self.mode {
-            BackendMode::Local(conn) => conn.get_all_file_paths().await,
+            BackendMode::Local(conn) => conn.get_all_file_paths(&self.tenant_id()).await,
             BackendMode::Remote { url, token, client } => {
                 let resp = client.get(format!("{}/api/files", url))
                     .header("Authorization", format!("Bearer {}", token))
@@ -377,7 +434,7 @@ impl BackendClient {
 
     pub async fn get_historical_engram_solutions(&self, file_path: &str) -> anyhow::Result<Vec<String>> {
         match &self.mode {
-            BackendMode::Local(conn) => conn.get_historical_engram_solutions(file_path).await,
+            BackendMode::Local(conn) => conn.get_historical_engram_solutions(&self.tenant_id(), file_path).await,
             BackendMode::Remote { url, token, client } => {
                 let resp = client.get(format!("{}/api/historical-engrams", url))
                     .header("Authorization", format!("Bearer {}", token))
@@ -396,7 +453,7 @@ impl BackendClient {
 
     pub async fn get_recent_lessons(&self, limit: i64, file_filter: Option<String>) -> anyhow::Result<Vec<LessonRecord>> {
         match &self.mode {
-            BackendMode::Local(conn) => conn.get_recent_lessons(limit, file_filter).await,
+            BackendMode::Local(conn) => conn.get_recent_lessons(&self.tenant_id(), limit, file_filter).await,
             BackendMode::Remote { url, token, client } => {
                 let mut req = client.get(format!("{}/api/lessons", url))
                     .header("Authorization", format!("Bearer {}", token))
@@ -417,7 +474,7 @@ impl BackendClient {
 
     pub async fn get_outgoing_dependencies(&self, file_path: &str) -> anyhow::Result<Vec<String>> {
         match &self.mode {
-            BackendMode::Local(conn) => conn.get_outgoing_dependencies(file_path).await,
+            BackendMode::Local(conn) => conn.get_outgoing_dependencies(&self.tenant_id(), file_path).await,
             BackendMode::Remote { url, token, client } => {
                 let resp = client.get(format!("{}/api/outgoing-dependencies", url))
                     .header("Authorization", format!("Bearer {}", token))
@@ -436,7 +493,7 @@ impl BackendClient {
 
     pub async fn get_incoming_dependencies(&self, file_path: &str) -> anyhow::Result<Vec<String>> {
         match &self.mode {
-            BackendMode::Local(conn) => conn.get_incoming_dependencies(file_path).await,
+            BackendMode::Local(conn) => conn.get_incoming_dependencies(&self.tenant_id(), file_path).await,
             BackendMode::Remote { url, token, client } => {
                 let resp = client.get(format!("{}/api/incoming-dependencies", url))
                     .header("Authorization", format!("Bearer {}", token))
@@ -455,7 +512,7 @@ impl BackendClient {
 
     pub async fn get_file_context(&self, file_path: &str) -> anyhow::Result<Option<FileGraphContext>> {
         match &self.mode {
-            BackendMode::Local(conn) => conn.get_file_context(file_path).await,
+            BackendMode::Local(conn) => conn.get_file_context(&self.tenant_id(), file_path).await,
             BackendMode::Remote { url, token, client } => {
                 let resp = client.get(format!("{}/api/file-context", url))
                     .header("Authorization", format!("Bearer {}", token))
@@ -474,7 +531,7 @@ impl BackendClient {
 
     pub async fn get_graph_summary(&self) -> anyhow::Result<GraphSummary> {
         match &self.mode {
-            BackendMode::Local(conn) => conn.get_graph_summary().await,
+            BackendMode::Local(conn) => conn.get_graph_summary(&self.tenant_id()).await,
             BackendMode::Remote { url, token, client } => {
                 let resp = client.get(format!("{}/api/graph-summary", url))
                     .header("Authorization", format!("Bearer {}", token))
@@ -494,10 +551,11 @@ impl BackendClient {
         match &self.mode {
             BackendMode::Local(conn) => {
                 let query_str = "MATCH (f:File)-[:CONTAINS]->(fn:Function) \
-                                 WHERE fn.name = $symbol_name AND f.path STARTS WITH $project_path \
+                                 WHERE f.tenant_id = $tenant_id AND fn.name = $symbol_name AND f.path STARTS WITH $project_path \
                                  RETURN f.path AS path, fn.start_line AS start_line";
                 let mut query_result = conn.graph().execute(
                     neo4rs::query(query_str)
+                        .param("tenant_id", self.tenant_id().as_str())
                         .param("symbol_name", symbol_name)
                         .param("project_path", project_path)
                 ).await?;
@@ -520,6 +578,57 @@ impl BackendClient {
                     Ok(results)
                 } else {
                     Err(anyhow::anyhow!("Remote find_symbol failed: status {}", resp.status()))
+                }
+            }
+        }
+    }
+
+    pub async fn create_user(&self, username: &str, role: &str) -> anyhow::Result<String> {
+        match &self.mode {
+            BackendMode::Local(conn) => {
+                let token_bytes = {
+                    use rand::RngCore;
+                    let mut b = [0u8; 16];
+                    rand::thread_rng().fill_bytes(&mut b);
+                    b
+                };
+                let token_hex: String = token_bytes.iter().map(|b| format!("{:02x}", b)).collect();
+                
+                let token = std::env::var("OZYBASE_MCP_TOKEN")
+                    .ok()
+                    .or_else(|| {
+                        let (_, cfg) = load_config().ok()?;
+                        cfg.token
+                    })
+                    .unwrap_or_else(|| "ozys_8f7e_8f7e50d578a699177eba16c7".to_string());
+                
+                let tenant_id = if token.starts_with("ozy_partner_ctx_") && token.contains("_usr_") {
+                    let trimmed = &token["ozy_partner_ctx_".len()..];
+                    let parts: Vec<&str> = trimmed.split("_usr_").collect();
+                    parts[0].to_string()
+                } else {
+                    "default_tenant".to_string()
+                };
+
+                conn.create_user(&tenant_id, username, role, &token_hex).await?;
+                Ok(format!("ozy_partner_ctx_{}_usr_{}", tenant_id, token_hex))
+            }
+            BackendMode::Remote { url, token, client } => {
+                let resp = client.post(format!("{}/api/team/create", url))
+                    .header("Authorization", format!("Bearer {}", token))
+                    .json(&serde_json::json!({
+                        "username": username,
+                        "role": role,
+                    }))
+                    .send()
+                    .await?;
+                if resp.status().is_success() {
+                    let val: serde_json::Value = resp.json().await?;
+                    let cred: &str = val.get("credential").and_then(serde_json::Value::as_str)
+                        .ok_or_else(|| anyhow::anyhow!("Credential not returned by server"))?;
+                    Ok(cred.to_string())
+                } else {
+                    Err(anyhow::anyhow!("Remote team create failed: status {}", resp.status()))
                 }
             }
         }
@@ -548,6 +657,545 @@ struct StatusMetricsJson {
     files_indexed: i64,
     functions_mapped: i64,
     engrams_formed: i64,
+}
+
+fn parse_unified_credential(cred: &str) -> Option<(String, String)> {
+    if !cred.starts_with("ozy_partner_ctx_") {
+        return None;
+    }
+    let after_prefix = &cred["ozy_partner_ctx_".len()..];
+    let parts: Vec<&str> = after_prefix.split("_usr_").collect();
+    if parts.len() != 2 {
+        return None;
+    }
+    Some((parts[0].to_string(), parts[1].to_string()))
+}
+
+async fn run_mcp_install() -> anyhow::Result<()> {
+    use dialoguer::{theme::ColorfulTheme, Input};
+
+    println!("=========================================================");
+    println!("     INSTALACIÓN INTERACTIVA DE OZYMEM-PARTNER MCP       ");
+    println!("=========================================================");
+    println!();
+
+    let credential: String = Input::with_theme(&ColorfulTheme::default())
+        .with_prompt("Introduce tu Credencial Unificada (ozy_partner_ctx_[server_uuid]_usr_[user_token])")
+        .interact_text()?;
+
+    let (server_uuid, user_token) = match parse_unified_credential(credential.trim()) {
+        Some(pair) => pair,
+        None => {
+            println!("[ERROR] Formato de credencial inválido. Debe seguir el formato:");
+            println!("  ozy_partner_ctx_[server_uuid]_usr_[user_token]");
+            return Ok(());
+        }
+    };
+
+    let server_url: String = Input::with_theme(&ColorfulTheme::default())
+        .with_prompt("Introduce la URL del Servidor Central")
+        .default("http://localhost:8080".to_string())
+        .interact_text()?;
+
+    println!("[INFO] Validando conexión con el servidor...");
+    let client = reqwest::Client::new();
+    let ping_res = client.get(format!("{}/api/health", server_url.trim().trim_end_matches('/')))
+        .header("Authorization", format!("Bearer {}", credential.trim()))
+        .send()
+        .await;
+
+    match ping_res {
+        Ok(resp) if resp.status().is_success() => {
+            println!("[SUCCESS] Conexión y credencial validadas con éxito.");
+        }
+        Ok(resp) => {
+            println!("[ERROR] El servidor respondió con estado: {}", resp.status());
+            println!("Por favor verifica la credencial o el estado del servidor.");
+            return Ok(());
+        }
+        Err(e) => {
+            println!("[ERROR] No se pudo conectar al servidor: {:?}", e);
+            println!("Por favor verifica la URL del servidor y tu conexión de red.");
+            return Ok(());
+        }
+    }
+
+    // Guardar en la configuración local .ozymem.toml
+    if let Ok((path, mut config)) = load_config() {
+        let brain_name = format!("remote_{}", server_uuid);
+        config.brains.insert(brain_name.clone(), BrainConfig {
+            host: server_url.trim().to_string(),
+            port: 80,
+        });
+        config.current_brain = brain_name;
+        config.token = Some(credential.trim().to_string());
+        if let Err(e) = save_config(&path, &config) {
+            println!("[WARNING] No se pudo guardar la configuración en .ozymem.toml: {:?}", e);
+        } else {
+            println!("[SUCCESS] Configuración local actualizada en .ozymem.toml");
+        }
+    }
+
+    // Inyectar en Cursor/VS Code
+    let home_dir = home::home_dir().context("No se pudo determinar el directorio home.")?;
+    let cursor_path = if cfg!(target_os = "windows") {
+        let appdata = std::env::var("APPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| home_dir.join("AppData").join("Roaming"));
+        appdata.join("Cursor").join("User").join("globalStorage").join("saoudrizwan.claude-dev").join("settings").join("mcp_config.json")
+    } else if cfg!(target_os = "macos") {
+        home_dir.join("Library").join("Application Support").join("Cursor").join("User").join("globalStorage").join("saoudrizwan.claude-dev").join("settings").join("mcp_config.json")
+    } else {
+        home_dir.join(".config").join("Cursor").join("User").join("globalStorage").join("saoudrizwan.claude-dev").join("settings").join("mcp_config.json")
+    };
+
+    let claude_path = if cfg!(target_os = "windows") {
+        let appdata = std::env::var("APPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| home_dir.join("AppData").join("Roaming"));
+        appdata.join("Claude").join("claude_desktop_config.json")
+    } else if cfg!(target_os = "macos") {
+        home_dir.join("Library").join("Application Support").join("Claude").join("claude_desktop_config.json")
+    } else {
+        home_dir.join(".config").join("Claude").join("claude_desktop_config.json")
+    };
+
+    struct McpTarget {
+        name: &'static str,
+        path: PathBuf,
+    }
+
+    let targets = vec![
+        McpTarget {
+            name: "VS Code (Antigravity / Claude Dev)",
+            path: home_dir.join(".gemini").join("antigravity").join("mcp_config.json"),
+        },
+        McpTarget {
+            name: "Cursor Editor",
+            path: cursor_path,
+        },
+        McpTarget {
+            name: "Claude Desktop",
+            path: claude_path,
+        },
+    ];
+
+    let mut detected = Vec::new();
+    for target in targets {
+        if target.path.exists() {
+            detected.push(target);
+        }
+    }
+
+    let selected_target = if detected.is_empty() {
+        println!("No se detectó ningún archivo de configuración MCP activo.");
+        println!("1) VS Code (Antigravity / Claude Dev)");
+        println!("2) Cursor Editor");
+        println!("3) Claude Desktop");
+        print!("Selecciona una opción para inicializarla (Enter para omitir): ");
+        use std::io::Write;
+        std::io::stdout().flush()?;
+        
+        let mut choice_str = String::new();
+        std::io::stdin().read_line(&mut choice_str)?;
+        let choice = choice_str.trim().parse::<usize>().ok();
+        
+        let targets_all = vec![
+            McpTarget {
+                name: "VS Code (Antigravity / Claude Dev)",
+                path: home_dir.join(".gemini").join("antigravity").join("mcp_config.json"),
+            },
+            McpTarget {
+                name: "Cursor Editor",
+                path: if cfg!(target_os = "windows") {
+                    let appdata = std::env::var("APPDATA")
+                        .map(PathBuf::from)
+                        .unwrap_or_else(|_| home_dir.join("AppData").join("Roaming"));
+                    appdata.join("Cursor").join("User").join("globalStorage").join("saoudrizwan.claude-dev").join("settings").join("mcp_config.json")
+                } else if cfg!(target_os = "macos") {
+                    home_dir.join("Library").join("Application Support").join("Cursor").join("User").join("globalStorage").join("saoudrizwan.claude-dev").join("settings").join("mcp_config.json")
+                } else {
+                    home_dir.join(".config").join("Cursor").join("User").join("globalStorage").join("saoudrizwan.claude-dev").join("settings").join("mcp_config.json")
+                },
+            },
+            McpTarget {
+                name: "Claude Desktop",
+                path: if cfg!(target_os = "windows") {
+                    let appdata = std::env::var("APPDATA")
+                        .map(PathBuf::from)
+                        .unwrap_or_else(|_| home_dir.join("AppData").join("Roaming"));
+                    appdata.join("Claude").join("claude_desktop_config.json")
+                } else if cfg!(target_os = "macos") {
+                    home_dir.join("Library").join("Application Support").join("Claude").join("claude_desktop_config.json")
+                } else {
+                    home_dir.join(".config").join("Claude").join("claude_desktop_config.json")
+                },
+            },
+        ];
+        
+        match choice {
+            Some(1) => targets_all.into_iter().nth(0),
+            Some(2) => targets_all.into_iter().nth(1),
+            Some(3) => targets_all.into_iter().nth(2),
+            _ => None,
+        }
+    } else {
+        println!("Entornos MCP detectados:");
+        for (i, target) in detected.iter().enumerate() {
+            println!("  {}) {}", i + 1, target.name);
+        }
+        print!("Selecciona el número del entorno a configurar (Enter para omitir): ");
+        use std::io::Write;
+        std::io::stdout().flush()?;
+        
+        let mut choice_str = String::new();
+        std::io::stdin().read_line(&mut choice_str)?;
+        let choice = choice_str.trim().parse::<usize>().ok();
+        match choice {
+            Some(idx) if idx > 0 && idx <= detected.len() => {
+                Some(detected.remove(idx - 1))
+            }
+            _ => None,
+        }
+    };
+
+    if let Some(target) = selected_target {
+        let path = target.path;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        
+        let content = if path.exists() {
+            std::fs::read_to_string(&path).unwrap_or_default()
+        } else {
+            String::new()
+        };
+
+        let mut json_val: serde_json::Value = if content.trim().is_empty() {
+            serde_json::json!({
+                "mcpServers": {}
+            })
+        } else {
+            serde_json::from_str(&content).unwrap_or_else(|_| {
+                serde_json::json!({
+                    "mcpServers": {}
+                })
+            })
+        };
+
+        let ozymem_path = home_dir.join(".cargo").join("bin").join(if cfg!(windows) { "ozymem.exe" } else { "ozymem" });
+        let ozymem_cmd = if ozymem_path.exists() {
+            ozymem_path.to_string_lossy().to_string()
+        } else {
+            "ozymem".to_string()
+        };
+
+        let mcp_key = format!("ozymem-partner-{}", server_uuid);
+        let mcp_config_value = serde_json::json!({
+            "command": ozymem_cmd,
+            "args": ["mcp", "run"],
+            "env": {
+                "OZYMEM_SERVER_URL": server_url.trim().to_string(),
+                "OZYMEM_SERVER_ID": server_uuid.clone(),
+                "OZYMEM_USER_TOKEN": user_token.clone()
+            }
+        });
+
+        if let Some(mcp_servers) = json_val.get_mut("mcpServers") {
+            if let Some(mcp_servers_obj) = mcp_servers.as_object_mut() {
+                mcp_servers_obj.insert(mcp_key, mcp_config_value);
+            }
+        } else {
+            if let Some(obj) = json_val.as_object_mut() {
+                obj.insert(
+                    "mcpServers".to_string(),
+                    serde_json::json!({
+                        mcp_key: mcp_config_value
+                    })
+                );
+            }
+        }
+
+        let pretty_json = serde_json::to_string_pretty(&json_val)?;
+        std::fs::write(&path, pretty_json)?;
+        println!("[SUCCESS] Configuración inyectada con éxito en: {}", path.display());
+    }
+
+    Ok(())
+}
+
+async fn run_gpr_push(message: String) -> anyhow::Result<()> {
+    let connection = build_backend_client().await?;
+    let target_path = ".";
+    let canonical_target = canonicalize_target(target_path)?;
+
+    let project_root = resolve_project_root(&canonical_target);
+    let ignore_patterns = load_ignore_patterns_for_project(&project_root);
+    
+    const CARPETAS_EXCLUIDAS: &[&str] = &[
+        "vendor",
+        "node_modules",
+        "target",
+        ".git",
+        "storage",
+    ];
+
+    let should_descend_fn = |entry: &DirEntry| {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            return true;
+        };
+
+        let name_lower = name.to_lowercase();
+        let path_str_lower = path.to_string_lossy().to_lowercase();
+
+        if CARPETAS_EXCLUIDAS.iter().any(|&excl| name_lower == excl) {
+            return false;
+        }
+
+        if name_lower == "appdata"
+            || name_lower == "program files"
+            || name_lower == "programdata"
+            || name_lower == "system32"
+            || name_lower == "windows"
+            || name_lower == ".svn"
+            || name_lower == "node_modules"
+            || name_lower == "__pycache__"
+            || name_lower == ".venv"
+            || name_lower == "env"
+            || name_lower == "target"
+            || name_lower == "dist"
+            || name_lower == "build"
+            || name_lower == "ebwebview"
+            || name_lower == "bravesoftware"
+            || path_str_lower.contains("google/chrome")
+            || path_str_lower.contains("google\\chrome")
+            || path_str_lower.contains("microsoft/edge")
+            || path_str_lower.contains("microsoft\\edge")
+            || name_lower == "cache"
+            || name_lower == "local storage"
+            || name_lower == ".cursor"
+            || name_lower == ".vscode"
+            || name_lower == ".idea"
+            || name_lower == ".config"
+            || name_lower == ".anthropic"
+            || name_lower == ".ollama"
+        {
+            return false;
+        }
+
+        if name.starts_with('.') && name != "." {
+            return false;
+        }
+
+        if is_ignored_by_patterns(path, &ignore_patterns, &project_root) {
+            return false;
+        }
+
+        true
+    };
+
+    println!("GPR: Analizando archivos en el proyecto actual...");
+    let mut files = Vec::new();
+
+    for entry in WalkDir::new(&canonical_target)
+        .into_iter()
+        .filter_entry(should_descend_fn)
+        .filter_map(Result::ok)
+    {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+
+        if is_ignored_by_patterns(path, &ignore_patterns, &project_root) {
+            continue;
+        }
+
+        if is_garbage_file(path) {
+            continue;
+        }
+
+        if is_binary_file(path) {
+            continue;
+        }
+
+        let language = get_language_from_path(path);
+        let absolute_path = match fs::canonicalize(path) {
+            Ok(canonical) => canonical,
+            Err(_) => continue,
+        };
+        let absolute_file_path = clean_path(&absolute_path);
+
+        let source_code = match fs::read_to_string(path) {
+            Ok(contents) => contents,
+            Err(_) => continue,
+        };
+
+        if let Ok(map) = parse_source(&absolute_file_path, language, &source_code) {
+            files.push(map);
+        }
+    }
+
+    if files.is_empty() {
+        println!("No se encontraron archivos de código para incluir en el GPR.");
+        return Ok(());
+    }
+
+    println!("GPR: Enviando {} archivos al servidor con el mensaje '{}'...", files.len(), message);
+    
+    match &connection.mode {
+        BackendMode::Local(conn) => {
+            let gpr_id = conn.create_gpr_batch("local", "local_dev", &message, &files).await?;
+            println!("[SUCCESS] Graph Pull Request creado localmente con ID: {}", gpr_id);
+        }
+        BackendMode::Remote { url, token, client } => {
+            let resp = client.post(format!("{}/api/gpr/push", url))
+                .header("Authorization", format!("Bearer {}", token))
+                .json(&serde_json::json!({
+                    "message": message,
+                    "files": files,
+                }))
+                .send()
+                .await?;
+            if resp.status().is_success() {
+                let res_val: serde_json::Value = resp.json().await?;
+                if res_val.get("status").and_then(serde_json::Value::as_str) == Some("merged") {
+                    println!("[SUCCESS] Cambios fusionados directamente (rol Lead).");
+                } else {
+                    let gpr_id = res_val.get("gpr_id").and_then(serde_json::Value::as_i64).unwrap_or(0);
+                    println!("[SUCCESS] Graph Pull Request enviado con éxito. ID asignado: {}", gpr_id);
+                }
+            } else {
+                eprintln!("[ERROR] Falló el envío del GPR: {}", resp.status());
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn run_gpr_list() -> anyhow::Result<()> {
+    let connection = build_backend_client().await?;
+    match &connection.mode {
+        BackendMode::Local(conn) => {
+            let list = conn.get_pending_gprs("local").await?;
+            print_gpr_list(&list);
+        }
+        BackendMode::Remote { url, token, client } => {
+            let resp = client.get(format!("{}/api/gpr/list", url))
+                .header("Authorization", format!("Bearer {}", token))
+                .send()
+                .await?;
+            if resp.status().is_success() {
+                let list: Vec<ozymem_core::GprRecord> = resp.json().await?;
+                print_gpr_list(&list);
+            } else {
+                eprintln!("[ERROR] Falló al listar GPRs: {}", resp.status());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn print_gpr_list(list: &[ozymem_core::GprRecord]) {
+    if list.is_empty() {
+        println!("No hay Graph Pull Requests pendientes.");
+        return;
+    }
+    println!("Graph Pull Requests Pendientes:");
+    println!("+------+----------------------+----------------------+----------------------+");
+    println!("| ID   | Usuario              | Mensaje              | Fecha                |");
+    println!("+------+----------------------+----------------------+----------------------+");
+    for gpr in list {
+        println!("| {:<4} | {:<20} | {:<20} | {:<20} |", gpr.id, gpr.user, gpr.message, gpr.timestamp);
+    }
+    println!("+------+----------------------+----------------------+----------------------+");
+}
+
+async fn run_gpr_diff(gpr_id: i64) -> anyhow::Result<()> {
+    let connection = build_backend_client().await?;
+    match &connection.mode {
+        BackendMode::Local(conn) => {
+            if let Some((message, user, files, lessons)) = conn.get_gpr_diff("local", gpr_id).await? {
+                print_gpr_diff_details(gpr_id, &message, &user, &files, &lessons);
+            } else {
+                println!("No se encontró el GPR con ID {}", gpr_id);
+            }
+        }
+        BackendMode::Remote { url, token, client } => {
+            let resp = client.get(format!("{}/api/gpr/diff", url))
+                .header("Authorization", format!("Bearer {}", token))
+                .query(&[("gpr_id", gpr_id)])
+                .send()
+                .await?;
+            if resp.status().is_success() {
+                let val: serde_json::Value = resp.json().await?;
+                let message = val.get("message").and_then(serde_json::Value::as_str).unwrap_or("").to_string();
+                let user = val.get("user").and_then(serde_json::Value::as_str).unwrap_or("").to_string();
+                let files: Vec<FileDefinitionMap> = serde_json::from_value(val.get("files").cloned().unwrap_or(serde_json::Value::Array(vec![])))?;
+                let lessons: Vec<LessonRecord> = serde_json::from_value(val.get("lessons").cloned().unwrap_or(serde_json::Value::Array(vec![])))?;
+                print_gpr_diff_details(gpr_id, &message, &user, &files, &lessons);
+            } else {
+                eprintln!("[ERROR] Falló al obtener diff de GPR {}: {}", gpr_id, resp.status());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn print_gpr_diff_details(
+    gpr_id: i64,
+    message: &str,
+    user: &str,
+    files: &[FileDefinitionMap],
+    lessons: &[LessonRecord],
+) {
+    println!("Detalles del Graph Pull Request #{}", gpr_id);
+    println!("========================================");
+    println!("Usuario:   {}", user);
+    println!("Mensaje:   {}", message);
+    println!("Archivos Propuestos ({}):", files.len());
+    for file in files {
+        println!("  - {} ({}): {} símbolos", file.file_path, file.language, file.functions.len());
+        for function in &file.functions {
+            println!("      * {} [{:?}] líneas {}-{}", function.name, function.kind, function.start_line, function.end_line);
+        }
+    }
+    if !lessons.is_empty() {
+        println!("Lecciones Propuestas ({}):", lessons.len());
+        for lesson in lessons {
+            println!("  - Archivo: {}", lesson.file_path);
+            println!("    Error:   {}", lesson.error_type);
+            println!("    Solución: {}", lesson.solution);
+        }
+    }
+    println!("========================================");
+}
+
+async fn run_gpr_merge(gpr_id: i64) -> anyhow::Result<()> {
+    let connection = build_backend_client().await?;
+    match &connection.mode {
+        BackendMode::Local(conn) => {
+            conn.merge_gpr("local", gpr_id).await?;
+            println!("[SUCCESS] GPR #{} fusionado localmente con éxito.", gpr_id);
+        }
+        BackendMode::Remote { url, token, client } => {
+            let resp = client.post(format!("{}/api/gpr/merge", url))
+                .header("Authorization", format!("Bearer {}", token))
+                .json(&serde_json::json!({
+                    "gpr_id": gpr_id,
+                }))
+                .send()
+                .await?;
+            if resp.status().is_success() {
+                println!("[SUCCESS] GPR #{} fusionado con éxito en el servidor.", gpr_id);
+            } else {
+                eprintln!("[ERROR] Falló la fusión del GPR {}: {}", gpr_id, resp.status());
+            }
+        }
+    }
+    Ok(())
 }
 
 mod mcp;
@@ -594,6 +1242,40 @@ async fn main() -> anyhow::Result<()> {
                 }
                 McpSubcommand::Stop => {
                     return run_mcp_stop().await;
+                }
+                McpSubcommand::Install => {
+                    return run_mcp_install().await;
+                }
+            }
+        }
+        Commands::Team { subcommand } => {
+            let connection = build_backend_client().await?;
+            match subcommand {
+                TeamSubcommand::Create { user, role } => {
+                    let cred = connection.create_user(user, role).await?;
+                    println!("[SUCCESS] Usuario creado con éxito.");
+                    println!("🔑 CREDENCIAL UNIFICADA: {}", cred);
+                    return Ok(());
+                }
+            }
+        }
+        Commands::Gpr { subcommand } => {
+            match subcommand {
+                GprSubcommand::Push { message } => {
+                    run_gpr_push(message.clone()).await?;
+                    return Ok(());
+                }
+                GprSubcommand::List => {
+                    run_gpr_list().await?;
+                    return Ok(());
+                }
+                GprSubcommand::Diff { gpr_id } => {
+                    run_gpr_diff(*gpr_id).await?;
+                    return Ok(());
+                }
+                GprSubcommand::Merge { gpr_id } => {
+                    run_gpr_merge(*gpr_id).await?;
+                    return Ok(());
                 }
             }
         }
@@ -653,6 +1335,8 @@ async fn main() -> anyhow::Result<()> {
         Commands::Init => unreachable!(),
         Commands::Mcp { .. } => unreachable!(),
         Commands::Doctor { .. } => unreachable!(),
+        Commands::Team { .. } => unreachable!(),
+        Commands::Gpr { .. } => unreachable!(),
     }
 
     Ok(())
@@ -660,20 +1344,21 @@ async fn main() -> anyhow::Result<()> {
 
 pub async fn build_backend_client() -> anyhow::Result<BackendClient> {
     let (_, config) = load_config().unwrap_or_else(|_| (PathBuf::new(), OzymemConfig::default()));
-    let brain_name = std::env::var("MEMGRAPH_URI")
+    
+    let host_env = std::env::var("OZYMEM_SERVER_URL")
         .ok()
-        .unwrap_or_else(|| config.current_brain.clone());
+        .or_else(|| std::env::var("MEMGRAPH_URI").ok());
 
-    let (host, port) = if let Some(brain_cfg) = config.brains.get(&brain_name) {
-        (brain_cfg.host.clone(), brain_cfg.port)
+    let token_env = if let (Ok(server_id), Ok(user_token)) = (std::env::var("OZYMEM_SERVER_ID"), std::env::var("OZYMEM_USER_TOKEN")) {
+        Some(format!("ozy_partner_ctx_{}_usr_{}", server_id, user_token))
     } else {
-        (brain_name, 7687)
+        std::env::var("OZYBASE_MCP_TOKEN")
+            .ok()
+            .or_else(|| config.token.clone())
     };
 
-    let token = std::env::var("OZYBASE_MCP_TOKEN")
-        .ok()
-        .or_else(|| config.token.clone())
-        .unwrap_or_else(|| "ozys_8f7e_8f7e50d578a699177eba16c7".to_string());
+    let host = host_env.unwrap_or_else(|| config.current_brain.clone());
+    let token = token_env.unwrap_or_else(|| "ozys_8f7e_8f7e50d578a699177eba16c7".to_string());
 
     if host.starts_with("http://") || host.starts_with("https://") {
         let client = reqwest::Client::new();
@@ -685,8 +1370,13 @@ pub async fn build_backend_client() -> anyhow::Result<BackendClient> {
             }
         })
     } else {
+        let (host_str, port) = if let Some(brain_cfg) = config.brains.get(&host) {
+            (brain_cfg.host.clone(), brain_cfg.port)
+        } else {
+            (host.clone(), 7687)
+        };
         let memgraph_config = MemgraphConfig {
-            uri: if host.contains(':') { host } else { format!("{}:{}", host, port) },
+            uri: if host_str.contains(':') { host_str } else { format!("{}:{}", host_str, port) },
             user: std::env::var("MEMGRAPH_USER").unwrap_or_else(|_| "admin".to_string()),
             password: std::env::var("MEMGRAPH_PASSWORD").unwrap_or_else(|_| "admin".to_string()),
             database: std::env::var("MEMGRAPH_DATABASE").unwrap_or_else(|_| default_memgraph_database().to_string()),
