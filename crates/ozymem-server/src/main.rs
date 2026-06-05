@@ -2,6 +2,14 @@ use ozymem_core::{
     default_memgraph_database, default_memgraph_uri, FileGraphContext, GraphSummary,
     MemgraphConfig, MemgraphConnection,
 };
+use axum::{
+    extract::{Query, State},
+    http::{HeaderMap, StatusCode},
+    middleware::{self, Next},
+    response::Response,
+    routing::{get, post},
+    Json, Router,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::sync::Arc;
@@ -86,8 +94,16 @@ struct ContentBlock {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let is_web = std::env::args().any(|arg| arg == "--web")
+        || std::env::var("OZYMEM_SERVER_MODE").as_deref() == Ok("web");
+
     let connection_cell = Arc::new(OnceCell::new());
-    run_server(connection_cell).await
+
+    if is_web {
+        run_web_server(connection_cell).await
+    } else {
+        run_server(connection_cell).await
+    }
 }
 
 async fn run_server(connection_cell: Arc<OnceCell<MemgraphConnection>>) -> anyhow::Result<()> {
@@ -466,4 +482,281 @@ mod tests {
         let without_history = prepend_historical_engrams(&[], body.clone());
         assert_eq!(without_history, body);
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct DependencyRelationInput {
+    origin_path: String,
+    destination_path: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct LessonInput {
+    file_path: String,
+    symbol_name: Option<String>,
+    error_context: String,
+    solution: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClearFileSymbolsInput {
+    file_path: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeleteFileInput {
+    file_path: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeleteProjectFilesInput {
+    project_path: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct FilePathQuery {
+    file_path: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct LessonsQuery {
+    limit: i64,
+    file_filter: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FindSymbolQuery {
+    symbol_name: String,
+    project_path: String,
+}
+
+async fn auth_middleware(
+    headers: HeaderMap,
+    request: axum::extract::Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    let expected_token = std::env::var("OZYBASE_MCP_TOKEN")
+        .unwrap_or_else(|_| "ozys_8f7e_8f7e50d578a699177eba16c7".to_string());
+    
+    if let Some(auth_header) = headers.get("Authorization") {
+        if let Ok(auth_str) = auth_header.to_str() {
+            if auth_str.starts_with("Bearer ") && &auth_str[7..] == expected_token {
+                return Ok(next.run(request).await);
+            }
+        }
+    }
+    
+    Err(StatusCode::UNAUTHORIZED)
+}
+
+async fn run_web_server(connection_cell: Arc<OnceCell<MemgraphConnection>>) -> anyhow::Result<()> {
+    let port = std::env::var("PORT")
+        .ok()
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or(8080);
+    let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
+    eprintln!("[INFO] Iniciando servidor web de Ozymem-Partner en {}", addr);
+
+    let app = Router::new()
+        .route("/api/health", get(handle_health))
+        .route("/api/clear", post(handle_clear))
+        .route("/api/file-definition", post(handle_file_definition))
+        .route("/api/dependency-relation", post(handle_dependency_relation))
+        .route("/api/lesson", post(handle_lesson))
+        .route("/api/clear-file-symbols", post(handle_clear_file_symbols))
+        .route("/api/delete-file", post(handle_delete_file))
+        .route("/api/delete-project-files", post(handle_delete_project_files))
+        .route("/api/files", get(handle_get_all_files))
+        .route("/api/historical-engrams", get(handle_historical_engrams))
+        .route("/api/lessons", get(handle_get_lessons))
+        .route("/api/outgoing-dependencies", get(handle_outgoing_dependencies))
+        .route("/api/incoming-dependencies", get(handle_incoming_dependencies))
+        .route("/api/file-context", get(handle_file_context))
+        .route("/api/graph-summary", get(handle_graph_summary))
+        .route("/api/find-symbol", get(handle_find_symbol))
+        .layer(middleware::from_fn(auth_middleware))
+        .with_state(connection_cell);
+
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+async fn handle_health(
+    State(conn_cell): State<Arc<OnceCell<MemgraphConnection>>>,
+) -> Result<Json<Value>, StatusCode> {
+    let conn = get_connection(&conn_cell).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    conn.ping().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(json!({ "status": "ok" })))
+}
+
+async fn handle_clear(
+    State(conn_cell): State<Arc<OnceCell<MemgraphConnection>>>,
+) -> Result<StatusCode, StatusCode> {
+    let conn = get_connection(&conn_cell).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    conn.clear_graph().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(StatusCode::OK)
+}
+
+async fn handle_file_definition(
+    State(conn_cell): State<Arc<OnceCell<MemgraphConnection>>>,
+    Json(file_map): Json<ozymem_parser::FileDefinitionMap>,
+) -> Result<StatusCode, StatusCode> {
+    let conn = get_connection(&conn_cell).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    conn.save_file_definition(&file_map).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(StatusCode::OK)
+}
+
+async fn handle_dependency_relation(
+    State(conn_cell): State<Arc<OnceCell<MemgraphConnection>>>,
+    Json(input): Json<DependencyRelationInput>,
+) -> Result<StatusCode, StatusCode> {
+    let conn = get_connection(&conn_cell).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    conn.save_dependency_relation(&input.origin_path, &input.destination_path)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(StatusCode::OK)
+}
+
+async fn handle_lesson(
+    State(conn_cell): State<Arc<OnceCell<MemgraphConnection>>>,
+    Json(input): Json<LessonInput>,
+) -> Result<StatusCode, StatusCode> {
+    let conn = get_connection(&conn_cell).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    conn.record_lesson(
+        &input.file_path,
+        input.symbol_name.as_deref(),
+        &input.error_context,
+        &input.solution,
+    )
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(StatusCode::OK)
+}
+
+async fn handle_clear_file_symbols(
+    State(conn_cell): State<Arc<OnceCell<MemgraphConnection>>>,
+    Json(input): Json<ClearFileSymbolsInput>,
+) -> Result<StatusCode, StatusCode> {
+    let conn = get_connection(&conn_cell).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    conn.clear_file_symbols_and_dependencies(&input.file_path)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(StatusCode::OK)
+}
+
+async fn handle_delete_file(
+    State(conn_cell): State<Arc<OnceCell<MemgraphConnection>>>,
+    Json(input): Json<DeleteFileInput>,
+) -> Result<Json<Value>, StatusCode> {
+    let conn = get_connection(&conn_cell).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let deleted = conn.delete_file_definition(&input.file_path)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(json!({ "deleted": deleted })))
+}
+
+async fn handle_delete_project_files(
+    State(conn_cell): State<Arc<OnceCell<MemgraphConnection>>>,
+    Json(input): Json<DeleteProjectFilesInput>,
+) -> Result<Json<Value>, StatusCode> {
+    let conn = get_connection(&conn_cell).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let deleted_count = conn.delete_project_files(&input.project_path)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(json!({ "deleted_count": deleted_count })))
+}
+
+async fn handle_get_all_files(
+    State(conn_cell): State<Arc<OnceCell<MemgraphConnection>>>,
+) -> Result<Json<Vec<String>>, StatusCode> {
+    let conn = get_connection(&conn_cell).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let files = conn.get_all_file_paths().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(files))
+}
+
+async fn handle_historical_engrams(
+    State(conn_cell): State<Arc<OnceCell<MemgraphConnection>>>,
+    Query(query): Query<FilePathQuery>,
+) -> Result<Json<Vec<String>>, StatusCode> {
+    let conn = get_connection(&conn_cell).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let solutions = conn.get_historical_engram_solutions(&query.file_path)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(solutions))
+}
+
+async fn handle_get_lessons(
+    State(conn_cell): State<Arc<OnceCell<MemgraphConnection>>>,
+    Query(query): Query<LessonsQuery>,
+) -> Result<Json<Vec<ozymem_core::LessonRecord>>, StatusCode> {
+    let conn = get_connection(&conn_cell).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let lessons = conn.get_recent_lessons(query.limit, query.file_filter)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(lessons))
+}
+
+async fn handle_outgoing_dependencies(
+    State(conn_cell): State<Arc<OnceCell<MemgraphConnection>>>,
+    Query(query): Query<FilePathQuery>,
+) -> Result<Json<Vec<String>>, StatusCode> {
+    let conn = get_connection(&conn_cell).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let deps = conn.get_outgoing_dependencies(&query.file_path)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(deps))
+}
+
+async fn handle_incoming_dependencies(
+    State(conn_cell): State<Arc<OnceCell<MemgraphConnection>>>,
+    Query(query): Query<FilePathQuery>,
+) -> Result<Json<Vec<String>>, StatusCode> {
+    let conn = get_connection(&conn_cell).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let deps = conn.get_incoming_dependencies(&query.file_path)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(deps))
+}
+
+async fn handle_file_context(
+    State(conn_cell): State<Arc<OnceCell<MemgraphConnection>>>,
+    Query(query): Query<FilePathQuery>,
+) -> Result<Json<Option<ozymem_core::FileGraphContext>>, StatusCode> {
+    let conn = get_connection(&conn_cell).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let ctx = conn.get_file_context(&query.file_path)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(ctx))
+}
+
+async fn handle_graph_summary(
+    State(conn_cell): State<Arc<OnceCell<MemgraphConnection>>>,
+) -> Result<Json<ozymem_core::GraphSummary>, StatusCode> {
+    let conn = get_connection(&conn_cell).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let summary = conn.get_graph_summary().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(summary))
+}
+
+async fn handle_find_symbol(
+    State(conn_cell): State<Arc<OnceCell<MemgraphConnection>>>,
+    Query(query): Query<FindSymbolQuery>,
+) -> Result<Json<Vec<String>>, StatusCode> {
+    let conn = get_connection(&conn_cell).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let query_str = "MATCH (f:File)-[:CONTAINS]->(fn:Function) \
+                     WHERE fn.name = $symbol_name AND f.path STARTS WITH $project_path \
+                     RETURN f.path AS path, fn.start_line AS start_line";
+    let mut query_result = conn.graph().execute(
+        neo4rs::query(query_str)
+            .param("symbol_name", query.symbol_name.as_str())
+            .param("project_path", query.project_path.as_str())
+    ).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let mut results = Vec::new();
+    while let Ok(Some(row)) = query_result.next().await {
+        if let (Ok(path), Ok(start_line)) = (row.get::<String>("path"), row.get::<i64>("start_line")) {
+            results.push(format!("Archivo: {} (Línea: {})", path, start_line));
+        }
+    }
+    Ok(Json(results))
 }

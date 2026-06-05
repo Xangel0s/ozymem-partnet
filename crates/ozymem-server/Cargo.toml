@@ -8,6 +8,10 @@ publish.workspace = true
 [dependencies]
 anyhow.workspace = true
 ozymem-core = { path = "../ozymem-core" }
+ozymem-parser = { path = "../ozymem-parser" }
+neo4rs = { workspace = true }
 serde.workspace = true
 serde_json = "1"
 tokio.workspace = true
+axum = "0.7"
+tower-http = { version = "0.5", features = ["cors"] }
