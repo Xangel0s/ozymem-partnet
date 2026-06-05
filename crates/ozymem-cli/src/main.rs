@@ -1,7 +1,7 @@
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use ozymem_core::{
-    default_memgraph_database, default_memgraph_uri, FileGraphContext, LessonRecord,
+    default_memgraph_database, default_memgraph_uri, FileGraphContext, GraphSummary, LessonRecord,
     MemgraphConfig, MemgraphConnection, StoredFunction,
 };
 use ozymem_parser::{
@@ -51,7 +51,8 @@ impl Default for OzymemConfig {
 }
 
 fn load_config() -> anyhow::Result<(PathBuf, OzymemConfig)> {
-    let config_path = PathBuf::from("C:\\Users\\Lenovo\\.ozymem.toml");
+    let home_dir = home::home_dir().context("No se pudo determinar el directorio home.")?;
+    let config_path = home_dir.join(".ozymem.toml");
     if !config_path.exists() {
         let default_config = OzymemConfig::default();
         let toml_str = toml::to_string_pretty(&default_config)?;
@@ -174,8 +175,359 @@ pub enum McpSubcommand {
     Stop,
 }
 
+#[derive(Clone)]
+pub enum BackendMode {
+    Local(MemgraphConnection),
+    Remote {
+        url: String,
+        token: String,
+        client: reqwest::Client,
+    },
+}
+
+#[derive(Clone)]
+pub struct BackendClient {
+    pub mode: BackendMode,
+}
+
+impl BackendClient {
+    pub fn display_uri(&self) -> String {
+        match &self.mode {
+            BackendMode::Local(_) => {
+                let raw_uri = std::env::var("MEMGRAPH_URI").unwrap_or_else(|_| default_memgraph_uri().to_string());
+                if raw_uri.contains("://") {
+                    raw_uri
+                } else {
+                    format!("bolt://{raw_uri}")
+                }
+            }
+            BackendMode::Remote { url, .. } => url.clone(),
+        }
+    }
+
+    pub async fn ping(&self) -> anyhow::Result<i64> {
+        match &self.mode {
+            BackendMode::Local(conn) => conn.ping().await,
+            BackendMode::Remote { url, token, client } => {
+                let resp = client.get(format!("{}/api/health", url))
+                    .header("Authorization", format!("Bearer {}", token))
+                    .send()
+                    .await?;
+                if resp.status().is_success() {
+                    Ok(1)
+                } else {
+                    Err(anyhow::anyhow!("Remote ping failed: status {}", resp.status()))
+                }
+            }
+        }
+    }
+
+    pub async fn clear_graph(&self) -> anyhow::Result<()> {
+        match &self.mode {
+            BackendMode::Local(conn) => conn.clear_graph().await,
+            BackendMode::Remote { url, token, client } => {
+                let resp = client.post(format!("{}/api/clear", url))
+                    .header("Authorization", format!("Bearer {}", token))
+                    .send()
+                    .await?;
+                if resp.status().is_success() {
+                    Ok(())
+                } else {
+                    Err(anyhow::anyhow!("Remote clear failed: status {}", resp.status()))
+                }
+            }
+        }
+    }
+
+    pub async fn save_file_definition(&self, file_map: &ozymem_parser::FileDefinitionMap) -> anyhow::Result<()> {
+        match &self.mode {
+            BackendMode::Local(conn) => conn.save_file_definition(file_map).await,
+            BackendMode::Remote { url, token, client } => {
+                let resp = client.post(format!("{}/api/file-definition", url))
+                    .header("Authorization", format!("Bearer {}", token))
+                    .json(file_map)
+                    .send()
+                    .await?;
+                if resp.status().is_success() {
+                    Ok(())
+                } else {
+                    Err(anyhow::anyhow!("Remote save_file_definition failed: status {}", resp.status()))
+                }
+            }
+        }
+    }
+
+    pub async fn save_dependency_relation(&self, origin_path: &str, destination_path: &str) -> anyhow::Result<()> {
+        match &self.mode {
+            BackendMode::Local(conn) => conn.save_dependency_relation(origin_path, destination_path).await,
+            BackendMode::Remote { url, token, client } => {
+                let resp = client.post(format!("{}/api/dependency-relation", url))
+                    .header("Authorization", format!("Bearer {}", token))
+                    .json(&serde_json::json!({
+                        "origin_path": origin_path,
+                        "destination_path": destination_path,
+                    }))
+                    .send()
+                    .await?;
+                if resp.status().is_success() {
+                    Ok(())
+                } else {
+                    Err(anyhow::anyhow!("Remote save_dependency_relation failed: status {}", resp.status()))
+                }
+            }
+        }
+    }
+
+    pub async fn record_lesson(&self, file_path: &str, symbol_name: Option<&str>, error_context: &str, solution: &str) -> anyhow::Result<()> {
+        match &self.mode {
+            BackendMode::Local(conn) => conn.record_lesson(file_path, symbol_name, error_context, solution).await,
+            BackendMode::Remote { url, token, client } => {
+                let resp = client.post(format!("{}/api/lesson", url))
+                    .header("Authorization", format!("Bearer {}", token))
+                    .json(&serde_json::json!({
+                        "file_path": file_path,
+                        "symbol_name": symbol_name,
+                        "error_context": error_context,
+                        "solution": solution,
+                    }))
+                    .send()
+                    .await?;
+                if resp.status().is_success() {
+                    Ok(())
+                } else {
+                    Err(anyhow::anyhow!("Remote record_lesson failed: status {}", resp.status()))
+                }
+            }
+        }
+    }
+
+    pub async fn clear_file_symbols_and_dependencies(&self, file_path: &str) -> anyhow::Result<()> {
+        match &self.mode {
+            BackendMode::Local(conn) => conn.clear_file_symbols_and_dependencies(file_path).await,
+            BackendMode::Remote { url, token, client } => {
+                let resp = client.post(format!("{}/api/clear-file-symbols", url))
+                    .header("Authorization", format!("Bearer {}", token))
+                    .json(&serde_json::json!({ "file_path": file_path }))
+                    .send()
+                    .await?;
+                if resp.status().is_success() {
+                    Ok(())
+                } else {
+                    Err(anyhow::anyhow!("Remote clear_file_symbols_and_dependencies failed: status {}", resp.status()))
+                }
+            }
+        }
+    }
+
+    pub async fn delete_file_definition(&self, file_path: &str) -> anyhow::Result<bool> {
+        match &self.mode {
+            BackendMode::Local(conn) => conn.delete_file_definition(file_path).await,
+            BackendMode::Remote { url, token, client } => {
+                let resp = client.post(format!("{}/api/delete-file", url))
+                    .header("Authorization", format!("Bearer {}", token))
+                    .json(&serde_json::json!({ "file_path": file_path }))
+                    .send()
+                    .await?;
+                if resp.status().is_success() {
+                    let body: serde_json::Value = resp.json().await?;
+                    Ok(body.get("deleted").and_then(serde_json::Value::as_bool).unwrap_or(false))
+                } else {
+                    Err(anyhow::anyhow!("Remote delete_file_definition failed: status {}", resp.status()))
+                }
+            }
+        }
+    }
+
+    pub async fn delete_project_files(&self, project_path: &str) -> anyhow::Result<i64> {
+        match &self.mode {
+            BackendMode::Local(conn) => conn.delete_project_files(project_path).await,
+            BackendMode::Remote { url, token, client } => {
+                let resp = client.post(format!("{}/api/delete-project-files", url))
+                    .header("Authorization", format!("Bearer {}", token))
+                    .json(&serde_json::json!({ "project_path": project_path }))
+                    .send()
+                    .await?;
+                if resp.status().is_success() {
+                    let body: serde_json::Value = resp.json().await?;
+                    Ok(body.get("deleted_count").and_then(serde_json::Value::as_i64).unwrap_or(0))
+                } else {
+                    Err(anyhow::anyhow!("Remote delete_project_files failed: status {}", resp.status()))
+                }
+            }
+        }
+    }
+
+    pub async fn get_all_file_paths(&self) -> anyhow::Result<Vec<String>> {
+        match &self.mode {
+            BackendMode::Local(conn) => conn.get_all_file_paths().await,
+            BackendMode::Remote { url, token, client } => {
+                let resp = client.get(format!("{}/api/files", url))
+                    .header("Authorization", format!("Bearer {}", token))
+                    .send()
+                    .await?;
+                if resp.status().is_success() {
+                    let paths: Vec<String> = resp.json().await?;
+                    Ok(paths)
+                } else {
+                    Err(anyhow::anyhow!("Remote get_all_file_paths failed: status {}", resp.status()))
+                }
+            }
+        }
+    }
+
+    pub async fn get_historical_engram_solutions(&self, file_path: &str) -> anyhow::Result<Vec<String>> {
+        match &self.mode {
+            BackendMode::Local(conn) => conn.get_historical_engram_solutions(file_path).await,
+            BackendMode::Remote { url, token, client } => {
+                let resp = client.get(format!("{}/api/historical-engrams", url))
+                    .header("Authorization", format!("Bearer {}", token))
+                    .query(&[("file_path", file_path)])
+                    .send()
+                    .await?;
+                if resp.status().is_success() {
+                    let solutions: Vec<String> = resp.json().await?;
+                    Ok(solutions)
+                } else {
+                    Err(anyhow::anyhow!("Remote get_historical_engram_solutions failed: status {}", resp.status()))
+                }
+            }
+        }
+    }
+
+    pub async fn get_recent_lessons(&self, limit: i64, file_filter: Option<String>) -> anyhow::Result<Vec<LessonRecord>> {
+        match &self.mode {
+            BackendMode::Local(conn) => conn.get_recent_lessons(limit, file_filter).await,
+            BackendMode::Remote { url, token, client } => {
+                let mut req = client.get(format!("{}/api/lessons", url))
+                    .header("Authorization", format!("Bearer {}", token))
+                    .query(&[("limit", limit)]);
+                if let Some(filter) = file_filter {
+                    req = req.query(&[("file_filter", filter)]);
+                }
+                let resp = req.send().await?;
+                if resp.status().is_success() {
+                    let lessons: Vec<LessonRecord> = resp.json().await?;
+                    Ok(lessons)
+                } else {
+                    Err(anyhow::anyhow!("Remote get_recent_lessons failed: status {}", resp.status()))
+                }
+            }
+        }
+    }
+
+    pub async fn get_outgoing_dependencies(&self, file_path: &str) -> anyhow::Result<Vec<String>> {
+        match &self.mode {
+            BackendMode::Local(conn) => conn.get_outgoing_dependencies(file_path).await,
+            BackendMode::Remote { url, token, client } => {
+                let resp = client.get(format!("{}/api/outgoing-dependencies", url))
+                    .header("Authorization", format!("Bearer {}", token))
+                    .query(&[("file_path", file_path)])
+                    .send()
+                    .await?;
+                if resp.status().is_success() {
+                    let paths: Vec<String> = resp.json().await?;
+                    Ok(paths)
+                } else {
+                    Err(anyhow::anyhow!("Remote get_outgoing_dependencies failed: status {}", resp.status()))
+                }
+            }
+        }
+    }
+
+    pub async fn get_incoming_dependencies(&self, file_path: &str) -> anyhow::Result<Vec<String>> {
+        match &self.mode {
+            BackendMode::Local(conn) => conn.get_incoming_dependencies(file_path).await,
+            BackendMode::Remote { url, token, client } => {
+                let resp = client.get(format!("{}/api/incoming-dependencies", url))
+                    .header("Authorization", format!("Bearer {}", token))
+                    .query(&[("file_path", file_path)])
+                    .send()
+                    .await?;
+                if resp.status().is_success() {
+                    let paths: Vec<String> = resp.json().await?;
+                    Ok(paths)
+                } else {
+                    Err(anyhow::anyhow!("Remote get_incoming_dependencies failed: status {}", resp.status()))
+                }
+            }
+        }
+    }
+
+    pub async fn get_file_context(&self, file_path: &str) -> anyhow::Result<Option<FileGraphContext>> {
+        match &self.mode {
+            BackendMode::Local(conn) => conn.get_file_context(file_path).await,
+            BackendMode::Remote { url, token, client } => {
+                let resp = client.get(format!("{}/api/file-context", url))
+                    .header("Authorization", format!("Bearer {}", token))
+                    .query(&[("file_path", file_path)])
+                    .send()
+                    .await?;
+                if resp.status().is_success() {
+                    let context: Option<FileGraphContext> = resp.json().await?;
+                    Ok(context)
+                } else {
+                    Err(anyhow::anyhow!("Remote get_file_context failed: status {}", resp.status()))
+                }
+            }
+        }
+    }
+
+    pub async fn get_graph_summary(&self) -> anyhow::Result<GraphSummary> {
+        match &self.mode {
+            BackendMode::Local(conn) => conn.get_graph_summary().await,
+            BackendMode::Remote { url, token, client } => {
+                let resp = client.get(format!("{}/api/graph-summary", url))
+                    .header("Authorization", format!("Bearer {}", token))
+                    .send()
+                    .await?;
+                if resp.status().is_success() {
+                    let summary: GraphSummary = resp.json().await?;
+                    Ok(summary)
+                } else {
+                    Err(anyhow::anyhow!("Remote get_graph_summary failed: status {}", resp.status()))
+                }
+            }
+        }
+    }
+
+    pub async fn find_symbol(&self, symbol_name: &str, project_path: &str) -> anyhow::Result<Vec<String>> {
+        match &self.mode {
+            BackendMode::Local(conn) => {
+                let query_str = "MATCH (f:File)-[:CONTAINS]->(fn:Function) \
+                                 WHERE fn.name = $symbol_name AND f.path STARTS WITH $project_path \
+                                 RETURN f.path AS path, fn.start_line AS start_line";
+                let mut query_result = conn.graph().execute(
+                    neo4rs::query(query_str)
+                        .param("symbol_name", symbol_name)
+                        .param("project_path", project_path)
+                ).await?;
+                let mut results = Vec::new();
+                while let Ok(Some(row)) = query_result.next().await {
+                    if let (Ok(path), Ok(start_line)) = (row.get::<String>("path"), row.get::<i64>("start_line")) {
+                        results.push(format!("Archivo: {} (Línea: {})", path, start_line));
+                    }
+                }
+                Ok(results)
+            }
+            BackendMode::Remote { url, token, client } => {
+                let resp = client.get(format!("{}/api/find-symbol", url))
+                    .header("Authorization", format!("Bearer {}", token))
+                    .query(&[("symbol_name", symbol_name), ("project_path", project_path)])
+                    .send()
+                    .await?;
+                if resp.status().is_success() {
+                    let results: Vec<String> = resp.json().await?;
+                    Ok(results)
+                } else {
+                    Err(anyhow::anyhow!("Remote find_symbol failed: status {}", resp.status()))
+                }
+            }
+        }
+    }
+}
+
 struct AppContext {
-    connection: MemgraphConnection,
+    connection: BackendClient,
     display_uri: String,
 }
 
@@ -248,8 +600,8 @@ async fn main() -> anyhow::Result<()> {
         _ => {}
     }
 
-    let connection = build_connection().await?;
-    let display_uri = display_memgraph_uri();
+    let connection = build_backend_client().await?;
+    let display_uri = connection.display_uri();
     let context = AppContext {
         connection,
         display_uri,
@@ -306,29 +658,43 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn build_connection() -> anyhow::Result<MemgraphConnection> {
-    let config = MemgraphConfig {
-        uri: std::env::var("MEMGRAPH_URI").unwrap_or_else(|_| default_memgraph_uri().to_string()),
-        user: std::env::var("MEMGRAPH_USER").unwrap_or_else(|_| "admin".to_string()),
-        password: std::env::var("MEMGRAPH_PASSWORD").unwrap_or_else(|_| "admin".to_string()),
-        database: std::env::var("MEMGRAPH_DATABASE")
-            .unwrap_or_else(|_| default_memgraph_database().to_string()),
+pub async fn build_backend_client() -> anyhow::Result<BackendClient> {
+    let (_, config) = load_config().unwrap_or_else(|_| (PathBuf::new(), OzymemConfig::default()));
+    let brain_name = std::env::var("MEMGRAPH_URI")
+        .ok()
+        .unwrap_or_else(|| config.current_brain.clone());
+
+    let (host, port) = if let Some(brain_cfg) = config.brains.get(&brain_name) {
+        (brain_cfg.host.clone(), brain_cfg.port)
+    } else {
+        (brain_name, 7687)
     };
 
-    MemgraphConnection::connect(config).await
-}
+    let token = std::env::var("OZYBASE_MCP_TOKEN")
+        .ok()
+        .or_else(|| config.token.clone())
+        .unwrap_or_else(|| "ozys_8f7e_8f7e50d578a699177eba16c7".to_string());
 
-fn display_memgraph_uri() -> String {
-    let raw_uri =
-        std::env::var("MEMGRAPH_URI").unwrap_or_else(|_| default_memgraph_uri().to_string());
-    display_memgraph_uri_from(&raw_uri)
-}
-
-fn display_memgraph_uri_from(raw_uri: &str) -> String {
-    if raw_uri.contains("://") {
-        raw_uri.to_string()
+    if host.starts_with("http://") || host.starts_with("https://") {
+        let client = reqwest::Client::new();
+        Ok(BackendClient {
+            mode: BackendMode::Remote {
+                url: host,
+                token,
+                client,
+            }
+        })
     } else {
-        format!("bolt://{raw_uri}")
+        let memgraph_config = MemgraphConfig {
+            uri: if host.contains(':') { host } else { format!("{}:{}", host, port) },
+            user: std::env::var("MEMGRAPH_USER").unwrap_or_else(|_| "admin".to_string()),
+            password: std::env::var("MEMGRAPH_PASSWORD").unwrap_or_else(|_| "admin".to_string()),
+            database: std::env::var("MEMGRAPH_DATABASE").unwrap_or_else(|_| default_memgraph_database().to_string()),
+        };
+        let connection = MemgraphConnection::connect(memgraph_config).await?;
+        Ok(BackendClient {
+            mode: BackendMode::Local(connection)
+        })
     }
 }
 
@@ -450,7 +816,7 @@ async fn print_status(context: &AppContext, json_output: bool) -> anyhow::Result
 }
 
 async fn scan_directory(
-    connection: &MemgraphConnection,
+    connection: &BackendClient,
     target_path: &str,
     reset: bool,
     force: bool,
@@ -691,7 +1057,7 @@ async fn scan_directory(
 }
 
 async fn print_lessons(
-    connection: &MemgraphConnection,
+    connection: &BackendClient,
     limit: usize,
     file_filter: Option<String>,
 ) -> anyhow::Result<()> {
@@ -720,7 +1086,7 @@ fn print_lesson_record(lesson: &LessonRecord) {
 }
 
 async fn print_tree(
-    connection: &MemgraphConnection,
+    connection: &BackendClient,
     file_path: &str,
     depth: u32,
 ) -> anyhow::Result<()> {
@@ -749,7 +1115,7 @@ struct TreeNode {
 }
 
 fn load_tree_node<'a>(
-    connection: &'a MemgraphConnection,
+    connection: &'a BackendClient,
     file_path: &'a str,
     remaining_depth: u32,
     visited: &'a mut HashSet<String>,
@@ -892,7 +1258,7 @@ fn render_tree_node(node: &TreeNode, prefix: &str, is_last: bool, is_root: bool)
 }
 
 async fn print_trace(
-    connection: &MemgraphConnection,
+    connection: &BackendClient,
     file_path: &str,
     depth: u32,
 ) -> anyhow::Result<()> {
@@ -911,7 +1277,7 @@ async fn print_trace(
 }
 
 fn load_trace_node<'a>(
-    connection: &'a MemgraphConnection,
+    connection: &'a BackendClient,
     file_path: &'a str,
     remaining_depth: u32,
     visited: &'a mut HashSet<String>,
@@ -1243,7 +1609,7 @@ async fn run_watch(context: &AppContext, target_path: &str, force: bool) -> anyh
         }
     };
 
-    let trigger_reconnect = |conn: ozymem_core::MemgraphConnection,
+    let trigger_reconnect = |conn: BackendClient,
                              is_conn: std::sync::Arc<AtomicBool>,
                              reconn: std::sync::Arc<AtomicBool>| {
          if reconn.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
@@ -1570,7 +1936,7 @@ fn should_watch_path(path: &Path, ignore_patterns: &[String], project_root: &Pat
     true
 }
 
-async fn index_single_file(connection: &MemgraphConnection, path: &Path) -> anyhow::Result<()> {
+async fn index_single_file(connection: &BackendClient, path: &Path) -> anyhow::Result<()> {
     let language = get_language_from_path(path);
     let absolute_path = fs::canonicalize(path)?;
     let absolute_file_path = clean_path(&absolute_path);
@@ -1992,7 +2358,7 @@ async fn run_deregister(name_arg: Option<String>) -> anyhow::Result<()> {
         println!("[SUCCESS] Registro del proyecto '{}' eliminado de ozymem.toml.", project_name);
 
         if let Some(ref path_str) = project_path {
-            if let Ok(conn) = build_connection().await {
+            if let Ok(conn) = build_backend_client().await {
                 if conn.ping().await.is_ok() {
                     use dialoguer::Confirm;
                     if Confirm::with_theme(&dialoguer::theme::ColorfulTheme::default())
@@ -2233,6 +2599,14 @@ mod tests {
         let _ = fs::remove_dir_all(&temp_root);
     }
 
+    fn display_memgraph_uri_from(uri: &str) -> String {
+        if uri.contains("://") {
+            uri.to_string()
+        } else {
+            format!("bolt://{}", uri)
+        }
+    }
+
     #[test]
     fn formats_status_uri_as_bolt() {
         assert_eq!(
@@ -2319,7 +2693,7 @@ fn get_project_identifier(target_path: &str) -> anyhow::Result<(String, String)>
 }
 
 fn is_pid_alive(pid: u32) -> bool {
-    #[cfg(windows)]
+    #[cfg(target_os = "windows")]
     {
         let output = std::process::Command::new("tasklist")
             .args(&["/FI", &format!("PID eq {}", pid), "/NH"])
@@ -2331,7 +2705,7 @@ fn is_pid_alive(pid: u32) -> bool {
             false
         }
     }
-    #[cfg(not(windows))]
+    #[cfg(not(target_os = "windows"))]
     {
         let status = std::process::Command::new("kill")
             .args(&["-0", &pid.to_string()])
@@ -2394,9 +2768,28 @@ fn shorten_path(path_str: &str, max_len: usize) -> String {
 
 async fn run_mcp_setup() -> anyhow::Result<()> {
     let home_dir = home::home_dir().context("No se pudo determinar el directorio home.")?;
-    let appdata = std::env::var("APPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| home_dir.join("AppData").join("Roaming"));
+
+    let cursor_path = if cfg!(target_os = "windows") {
+        let appdata = std::env::var("APPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| home_dir.join("AppData").join("Roaming"));
+        appdata.join("Cursor").join("User").join("globalStorage").join("saoudrizwan.claude-dev").join("settings").join("mcp_config.json")
+    } else if cfg!(target_os = "macos") {
+        home_dir.join("Library").join("Application Support").join("Cursor").join("User").join("globalStorage").join("saoudrizwan.claude-dev").join("settings").join("mcp_config.json")
+    } else {
+        home_dir.join(".config").join("Cursor").join("User").join("globalStorage").join("saoudrizwan.claude-dev").join("settings").join("mcp_config.json")
+    };
+
+    let claude_path = if cfg!(target_os = "windows") {
+        let appdata = std::env::var("APPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| home_dir.join("AppData").join("Roaming"));
+        appdata.join("Claude").join("claude_desktop_config.json")
+    } else if cfg!(target_os = "macos") {
+        home_dir.join("Library").join("Application Support").join("Claude").join("claude_desktop_config.json")
+    } else {
+        home_dir.join(".config").join("Claude").join("claude_desktop_config.json")
+    };
 
     struct McpTarget {
         name: &'static str,
@@ -2410,11 +2803,11 @@ async fn run_mcp_setup() -> anyhow::Result<()> {
         },
         McpTarget {
             name: "Cursor Editor",
-            path: appdata.join("Cursor").join("User").join("globalStorage").join("saoudrizwan.claude-dev").join("settings").join("mcp_config.json"),
+            path: cursor_path.clone(),
         },
         McpTarget {
             name: "Claude Desktop",
-            path: appdata.join("Claude").join("claude_desktop_config.json"),
+            path: claude_path.clone(),
         },
     ];
 
@@ -2446,11 +2839,11 @@ async fn run_mcp_setup() -> anyhow::Result<()> {
             },
             McpTarget {
                 name: "Cursor Editor",
-                path: appdata.join("Cursor").join("User").join("globalStorage").join("saoudrizwan.claude-dev").join("settings").join("mcp_config.json"),
+                path: cursor_path,
             },
             McpTarget {
                 name: "Claude Desktop",
-                path: appdata.join("Claude").join("claude_desktop_config.json"),
+                path: claude_path,
             },
         ];
         
@@ -2576,13 +2969,13 @@ async fn run_mcp_setup() -> anyhow::Result<()> {
 }
 
 fn kill_pid(pid: u32) -> anyhow::Result<()> {
-    #[cfg(windows)]
+    #[cfg(target_os = "windows")]
     {
         let _ = std::process::Command::new("taskkill")
             .args(&["/PID", &pid.to_string(), "/F"])
             .status()?;
     }
-    #[cfg(not(windows))]
+    #[cfg(not(target_os = "windows"))]
     {
         let _ = std::process::Command::new("kill")
             .args(&["-9", &pid.to_string()])
@@ -2685,11 +3078,13 @@ async fn run_init() -> anyhow::Result<()> {
 
     // Paso 1: Levantar e indexar la base de datos (Docker / Memgraph)
     let mut db_connected = false;
+    let mut db_uri = String::new();
 
     // Primer chequeo de conexión
-    if let Ok(conn) = build_connection().await {
+    if let Ok(conn) = build_backend_client().await {
         if conn.ping().await.is_ok() {
             db_connected = true;
+            db_uri = conn.display_uri();
         }
     }
 
@@ -2726,9 +3121,10 @@ async fn run_init() -> anyhow::Result<()> {
         // Bucle de re-intentos (retry loop)
         for attempt in 1..=5 {
             tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-            if let Ok(conn) = build_connection().await {
+            if let Ok(conn) = build_backend_client().await {
                 if conn.ping().await.is_ok() {
                     db_connected = true;
+                    db_uri = conn.display_uri();
                     break;
                 }
             }
@@ -2737,8 +3133,7 @@ async fn run_init() -> anyhow::Result<()> {
     }
 
     let db_status_str = if db_connected {
-        let uri = display_memgraph_uri();
-        format!("CONECTADO ({})", uri)
+        format!("CONECTADO ({})", db_uri)
     } else {
         "MODO WAL (Resiliencia local / Desconectado)".to_string()
     };
@@ -2796,7 +3191,8 @@ async fn run_init() -> anyhow::Result<()> {
 
 async fn run_doctor(json_output: bool) -> anyhow::Result<()> {
     // 1. Config file check
-    let config_path = PathBuf::from("C:\\Users\\Lenovo\\.ozymem.toml");
+    let home_dir = home::home_dir().context("No se pudo determinar el directorio home.")?;
+    let config_path = home_dir.join(".ozymem.toml");
     let config_exists = config_path.exists();
     let config_valid = if config_exists {
         load_config().is_ok()
@@ -2841,7 +3237,7 @@ async fn run_doctor(json_output: bool) -> anyhow::Result<()> {
     }
 
     // 5. Connect and ping check
-    let connection_res = build_connection().await;
+    let connection_res = build_backend_client().await;
     let (db_connected, db_ping_ok) = match &connection_res {
         Ok(conn) => {
             let ping_res = conn.ping().await;

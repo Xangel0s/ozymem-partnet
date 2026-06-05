@@ -1,5 +1,4 @@
 use anyhow::Context;
-use ozymem_core::{MemgraphConnection, MemgraphConfig, default_memgraph_uri, default_memgraph_database};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::sync::Arc;
@@ -189,20 +188,14 @@ pub async fn run_mcp_server() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn get_connection(cell: &OnceCell<MemgraphConnection>) -> anyhow::Result<&MemgraphConnection> {
+async fn get_connection(cell: &OnceCell<crate::BackendClient>) -> anyhow::Result<&crate::BackendClient> {
     cell.get_or_try_init(|| async {
-        let config = MemgraphConfig {
-            uri: std::env::var("MEMGRAPH_URI").unwrap_or_else(|_| default_memgraph_uri().to_string()),
-            user: std::env::var("MEMGRAPH_USER").unwrap_or_else(|_| "admin".to_string()),
-            password: std::env::var("MEMGRAPH_PASSWORD").unwrap_or_else(|_| "admin".to_string()),
-            database: std::env::var("MEMGRAPH_DATABASE").unwrap_or_else(|_| default_memgraph_database().to_string()),
-        };
-        MemgraphConnection::connect(config).await
+        crate::build_backend_client().await
     }).await
 }
 
 async fn handle_request(
-    connection_cell: &OnceCell<MemgraphConnection>,
+    connection_cell: &OnceCell<crate::BackendClient>,
     request: JsonRpcRequest,
 ) -> anyhow::Result<Option<JsonRpcResponse>> {
     if request.jsonrpc != "2.0" {
@@ -222,8 +215,9 @@ async fn handle_request(
             let mut project_verified = false;
             if let Some(params) = &request.params {
                 eprintln!("[DEBUG] params: {}", serde_json::to_string(&params).unwrap_or_default());
+                let home_dir = home::home_dir().unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
                 if let Err(e) = std::fs::write(
-                    "C:\\Users\\Lenovo\\Documents\\crmnew\\.ozymem-init-params.log",
+                    home_dir.join(".ozymem-init-params.log"),
                     serde_json::to_string_pretty(params).unwrap_or_default()
                 ) {
                     eprintln!("[ERROR] Failed to write init params log: {:?}", e);
@@ -250,8 +244,9 @@ async fn handle_request(
                                 eprintln!("[INFO] MCP inicializado para proyecto registrado: {} ({})", name, path);
                             }
                             Err(e) => {
+                                let home_dir = home::home_dir().unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
                                 if let Err(err) = std::fs::write(
-                                    "C:\\Users\\Lenovo\\Documents\\crmnew\\.ozymem-init-error.log",
+                                    home_dir.join(".ozymem-init-error.log"),
                                     format!("Path: {}\nError: {:?}", decoded_path, e)
                                 ) {
                                     eprintln!("[ERROR] Failed to write init error log: {:?}", err);
@@ -273,12 +268,12 @@ async fn handle_request(
                     load_res.as_ref().map(|(_, c)| format!("Projects keys: {:?}", c.projects.keys().collect::<Vec<_>>()))
                 );
                 if let Ok((_, config)) = load_res {
-                    if let Some(path) = config.projects.get("crmnew") {
+                    if let Some((name, path)) = config.projects.iter().next() {
                         let mut session = SESSION.lock().unwrap();
-                        session.current_project = Some("crmnew".to_string());
+                        session.current_project = Some(name.clone());
                         session.project_path = Some(path.clone());
                         project_verified = true;
-                        eprintln!("[INFO] MCP inicializado por fallback a crmnew: {}", path);
+                        eprintln!("[INFO] MCP inicializado por fallback a {}: {}", name, path);
                     }
                 }
             }
@@ -444,27 +439,12 @@ async fn handle_request(
                         .and_then(Value::as_str)
                         .ok_or_else(|| anyhow::anyhow!("missing symbol_name argument"))?;
 
-                    let query_str = "MATCH (f:File)-[:CONTAINS]->(fn:Function) \
-                                     WHERE fn.name = $symbol_name AND f.path STARTS WITH $project_path \
-                                     RETURN f.path AS path, fn.start_line AS start_line";
-                    
-                    let mut query_result = match connection.graph_connection_internal().execute(
-                        neo4rs::query(query_str)
-                            .param("symbol_name", symbol_name)
-                            .param("project_path", proj_path.as_str())
-                    ).await {
+                    let results = match connection.find_symbol(symbol_name, proj_path).await {
                         Ok(res) => res,
                         Err(e) => {
-                            return Ok(Some(error_response(id, -32603, &format!("Memgraph query error: {:?}", e))));
+                            return Ok(Some(error_response(id, -32603, &format!("Find symbol error: {:?}", e))));
                         }
                     };
-
-                    let mut results = Vec::new();
-                    while let Ok(Some(row)) = query_result.next().await {
-                        if let (Ok(path), Ok(start_line)) = (row.get::<String>("path"), row.get::<i64>("start_line")) {
-                            results.push(format!("Archivo: {} (Línea: {})", path, start_line));
-                        }
-                    }
 
                     let body = if results.is_empty() {
                         format!("Símbolo '{}' no encontrado en el proyecto '{}'.", symbol_name, session.current_project.as_deref().unwrap_or(""))
@@ -625,14 +605,5 @@ fn error_response(id: Value, code: i64, message: &str) -> JsonRpcResponse {
     }
 }
 
-// Extension trait to expose inner graph connection if needed
-trait MemgraphConnectionExt {
-    fn graph_connection_internal(&self) -> &neo4rs::Graph;
-}
 
-impl MemgraphConnectionExt for MemgraphConnection {
-    fn graph_connection_internal(&self) -> &neo4rs::Graph {
-        self.graph()
-    }
-}
 
