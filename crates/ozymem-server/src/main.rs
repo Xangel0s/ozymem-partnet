@@ -1,6 +1,6 @@
 use ozymem_core::{
     default_memgraph_database, default_memgraph_uri, FileGraphContext, GraphSummary,
-    MemgraphConfig, MemgraphConnection,
+    MemgraphConfig, MemgraphConnection, UserRecord,
 };
 use axum::{
     extract::{Query, State},
@@ -141,7 +141,40 @@ async fn get_connection(cell: &OnceCell<MemgraphConnection>) -> anyhow::Result<&
             database: std::env::var("MEMGRAPH_DATABASE")
                 .unwrap_or_else(|_| default_memgraph_database().to_string()),
         };
-        MemgraphConnection::connect(config).await
+        let conn = MemgraphConnection::connect(config).await?;
+        
+        // Setup Génesis if user database is empty
+        match conn.has_any_users().await {
+            Ok(false) => {
+                let master_tenant_id = "default_tenant";
+                let master_user = "admin";
+                
+                use rand::RngCore;
+                let mut token_bytes = [0u8; 16];
+                rand::thread_rng().fill_bytes(&mut token_bytes);
+                let master_token_hex: String = token_bytes.iter().map(|b| format!("{:02x}", b)).collect();
+                
+                let master_credential = format!("ozy_partner_ctx_{}_usr_{}", master_tenant_id, master_token_hex);
+                
+                if let Err(e) = conn.create_tenant("Default Tenant", master_tenant_id).await {
+                    eprintln!("[ERROR] Setup Génesis failed to create tenant: {:?}", e);
+                } else if let Err(e) = conn.create_user(master_tenant_id, master_user, "Lead", &master_token_hex).await {
+                    eprintln!("[ERROR] Setup Génesis failed to create user: {:?}", e);
+                } else {
+                    eprintln!("\n================ 🚀 OZYMEM-PARTNER SETUP ================");
+                    eprintln!("¡Base de datos limpia detectada! Creando primer Lead Developer...");
+                    eprintln!("\n🔑 CREDENCIAL MAESTRA GENERADA: {}", master_credential);
+                    eprintln!("📌 Guarda esta credencial de inmediato. La necesitarás para tu CLI local.");
+                    eprintln!("=========================================================\n");
+                }
+            }
+            Ok(true) => {}
+            Err(e) => {
+                eprintln!("[WARNING] Failed to query user database state: {:?}", e);
+            }
+        }
+        
+        Ok(conn)
     }).await
 }
 
@@ -271,9 +304,9 @@ async fn handle_request(
                 "file_context" => {
                     let file_path = read_string_argument(&tool_call.arguments, "file_path")
                         .or_else(|_| read_string_argument(&tool_call.arguments, "path"))?;
-                    let context = connection.get_file_context(&file_path).await?;
+                    let context = connection.get_file_context("local", &file_path).await?;
                     let historical_engrams = connection
-                        .get_historical_engram_solutions(&file_path)
+                        .get_historical_engram_solutions("local", &file_path)
                         .await?;
                     let body = format_file_context(context.as_ref(), &file_path);
                     ToolCallResult {
@@ -285,7 +318,7 @@ async fn handle_request(
                     }
                 }
                 "graph_summary" => {
-                    let summary = connection.get_graph_summary().await?;
+                    let summary = connection.get_graph_summary("local").await?;
                     ToolCallResult {
                         content: vec![ContentBlock {
                             kind: "text",
@@ -302,7 +335,7 @@ async fn handle_request(
                     let solution = read_string_argument(&tool_call.arguments, "solution")?;
 
                     connection
-                        .record_lesson(&file_path, symbol_name, &error_context, &solution)
+                        .record_lesson("local", &file_path, symbol_name, &error_context, &solution)
                         .await?;
 
                     ToolCallResult {
@@ -319,7 +352,7 @@ async fn handle_request(
                 "file_trace" => {
                     let file_path = read_string_argument(&tool_call.arguments, "file_path")
                         .or_else(|_| read_string_argument(&tool_call.arguments, "path"))?;
-                    let incoming = connection.get_incoming_dependencies(&file_path).await?;
+                    let incoming = connection.get_incoming_dependencies("local", &file_path).await?;
                     let mut text = format!("Reverse dependencies (files impacted by changes to {}):\n", file_path);
                     if incoming.is_empty() {
                         text.push_str("- (none)");
@@ -484,6 +517,10 @@ mod tests {
     }
 }
 
+// ==========================================
+// AXUM HTTP API WEB SERVER (COLLABORATIVE)
+// ==========================================
+
 #[derive(Debug, Deserialize)]
 struct DependencyRelationInput {
     origin_path: String,
@@ -530,23 +567,73 @@ struct FindSymbolQuery {
     project_path: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct CreateUserRequest {
+    username: String,
+    role: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GprPushRequest {
+    message: String,
+    files: Vec<ozymem_parser::FileDefinitionMap>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GprMergeRequest {
+    gpr_id: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct GprDiffQuery {
+    gpr_id: i64,
+}
+
 async fn auth_middleware(
+    State(conn_cell): State<Arc<OnceCell<MemgraphConnection>>>,
     headers: HeaderMap,
-    request: axum::extract::Request,
+    mut request: axum::extract::Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    let expected_token = std::env::var("OZYBASE_MCP_TOKEN")
-        .unwrap_or_else(|_| "ozys_8f7e_8f7e50d578a699177eba16c7".to_string());
+    let auth_header = headers.get("Authorization")
+        .and_then(|h| h.to_str().ok())
+        .ok_or(StatusCode::UNAUTHORIZED)?;
     
-    if let Some(auth_header) = headers.get("Authorization") {
-        if let Ok(auth_str) = auth_header.to_str() {
-            if auth_str.starts_with("Bearer ") && &auth_str[7..] == expected_token {
-                return Ok(next.run(request).await);
-            }
-        }
+    if !auth_header.starts_with("Bearer ") {
+        return Err(StatusCode::UNAUTHORIZED);
     }
-    
-    Err(StatusCode::UNAUTHORIZED)
+    let full_token = &auth_header[7..];
+
+    if full_token == "ozys_8f7e_8f7e50d578a699177eba16c7" {
+        let local_user = UserRecord {
+            name: "local_dev".to_string(),
+            role: "Lead".to_string(),
+            token: full_token.to_string(),
+            tenant_id: "local".to_string(),
+        };
+        request.extensions_mut().insert(local_user);
+        return Ok(next.run(request).await);
+    }
+
+    if !full_token.starts_with("ozy_partner_ctx_") || !full_token.contains("_usr_") {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
+    let trimmed = &full_token["ozy_partner_ctx_".len()..];
+    let parts: Vec<&str> = trimmed.split("_usr_").collect();
+    if parts.len() != 2 {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let server_uuid = parts[0];
+    let user_token = parts[1];
+
+    let conn = get_connection(&conn_cell).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if let Ok(Some(user)) = conn.verify_token(server_uuid, user_token).await {
+        request.extensions_mut().insert(user);
+        Ok(next.run(request).await)
+    } else {
+        Err(StatusCode::FORBIDDEN)
+    }
 }
 
 async fn run_web_server(connection_cell: Arc<OnceCell<MemgraphConnection>>) -> anyhow::Result<()> {
@@ -574,7 +661,13 @@ async fn run_web_server(connection_cell: Arc<OnceCell<MemgraphConnection>>) -> a
         .route("/api/file-context", get(handle_file_context))
         .route("/api/graph-summary", get(handle_graph_summary))
         .route("/api/find-symbol", get(handle_find_symbol))
-        .layer(middleware::from_fn(auth_middleware))
+        // IAM & GPR endpoints
+        .route("/api/team/create", post(handle_create_user))
+        .route("/api/gpr/push", post(handle_gpr_push))
+        .route("/api/gpr/list", get(handle_gpr_list))
+        .route("/api/gpr/diff", get(handle_gpr_diff))
+        .route("/api/gpr/merge", post(handle_gpr_merge))
+        .layer(middleware::from_fn_with_state(connection_cell.clone(), auth_middleware))
         .with_state(connection_cell);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -592,27 +685,41 @@ async fn handle_health(
 
 async fn handle_clear(
     State(conn_cell): State<Arc<OnceCell<MemgraphConnection>>>,
+    axum::Extension(user): axum::Extension<UserRecord>,
 ) -> Result<StatusCode, StatusCode> {
+    if user.role != "Lead" {
+        return Err(StatusCode::FORBIDDEN);
+    }
     let conn = get_connection(&conn_cell).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    conn.clear_graph().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    conn.clear_graph(&user.tenant_id).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(StatusCode::OK)
 }
 
 async fn handle_file_definition(
     State(conn_cell): State<Arc<OnceCell<MemgraphConnection>>>,
+    axum::Extension(user): axum::Extension<UserRecord>,
     Json(file_map): Json<ozymem_parser::FileDefinitionMap>,
-) -> Result<StatusCode, StatusCode> {
+) -> Result<Json<Value>, StatusCode> {
     let conn = get_connection(&conn_cell).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    conn.save_file_definition(&file_map).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(StatusCode::OK)
+    if user.role == "Lead" {
+        conn.save_file_definition(&user.tenant_id, &file_map).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        Ok(Json(json!({ "status": "merged" })))
+    } else {
+        let msg = format!("Auto-sync: {}", file_map.file_path);
+        let gpr_id = conn.create_gpr(&user.tenant_id, &user.name, &msg, &file_map)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        Ok(Json(json!({ "status": "pending", "gpr_id": gpr_id })))
+    }
 }
 
 async fn handle_dependency_relation(
     State(conn_cell): State<Arc<OnceCell<MemgraphConnection>>>,
+    axum::Extension(user): axum::Extension<UserRecord>,
     Json(input): Json<DependencyRelationInput>,
 ) -> Result<StatusCode, StatusCode> {
     let conn = get_connection(&conn_cell).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    conn.save_dependency_relation(&input.origin_path, &input.destination_path)
+    conn.save_dependency_relation(&user.tenant_id, &input.origin_path, &input.destination_path)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(StatusCode::OK)
@@ -620,26 +727,45 @@ async fn handle_dependency_relation(
 
 async fn handle_lesson(
     State(conn_cell): State<Arc<OnceCell<MemgraphConnection>>>,
+    axum::Extension(user): axum::Extension<UserRecord>,
     Json(input): Json<LessonInput>,
-) -> Result<StatusCode, StatusCode> {
+) -> Result<Json<Value>, StatusCode> {
     let conn = get_connection(&conn_cell).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    conn.record_lesson(
-        &input.file_path,
-        input.symbol_name.as_deref(),
-        &input.error_context,
-        &input.solution,
-    )
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(StatusCode::OK)
+    if user.role == "Lead" {
+        conn.record_lesson(
+            &user.tenant_id,
+            &input.file_path,
+            input.symbol_name.as_deref(),
+            &input.error_context,
+            &input.solution,
+        )
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        Ok(Json(json!({ "status": "merged" })))
+    } else {
+        let msg = format!("Lesson auto-sync: {}", input.file_path);
+        let gpr_id = conn.create_lesson_gpr(
+            &user.tenant_id,
+            &user.name,
+            &msg,
+            &input.file_path,
+            input.symbol_name.as_deref(),
+            &input.error_context,
+            &input.solution,
+        )
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        Ok(Json(json!({ "status": "pending", "gpr_id": gpr_id })))
+    }
 }
 
 async fn handle_clear_file_symbols(
     State(conn_cell): State<Arc<OnceCell<MemgraphConnection>>>,
+    axum::Extension(user): axum::Extension<UserRecord>,
     Json(input): Json<ClearFileSymbolsInput>,
 ) -> Result<StatusCode, StatusCode> {
     let conn = get_connection(&conn_cell).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    conn.clear_file_symbols_and_dependencies(&input.file_path)
+    conn.clear_file_symbols_and_dependencies(&user.tenant_id, &input.file_path)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(StatusCode::OK)
@@ -647,10 +773,11 @@ async fn handle_clear_file_symbols(
 
 async fn handle_delete_file(
     State(conn_cell): State<Arc<OnceCell<MemgraphConnection>>>,
+    axum::Extension(user): axum::Extension<UserRecord>,
     Json(input): Json<DeleteFileInput>,
 ) -> Result<Json<Value>, StatusCode> {
     let conn = get_connection(&conn_cell).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let deleted = conn.delete_file_definition(&input.file_path)
+    let deleted = conn.delete_file_definition(&user.tenant_id, &input.file_path)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(json!({ "deleted": deleted })))
@@ -658,10 +785,11 @@ async fn handle_delete_file(
 
 async fn handle_delete_project_files(
     State(conn_cell): State<Arc<OnceCell<MemgraphConnection>>>,
+    axum::Extension(user): axum::Extension<UserRecord>,
     Json(input): Json<DeleteProjectFilesInput>,
 ) -> Result<Json<Value>, StatusCode> {
     let conn = get_connection(&conn_cell).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let deleted_count = conn.delete_project_files(&input.project_path)
+    let deleted_count = conn.delete_project_files(&user.tenant_id, &input.project_path)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(json!({ "deleted_count": deleted_count })))
@@ -669,18 +797,20 @@ async fn handle_delete_project_files(
 
 async fn handle_get_all_files(
     State(conn_cell): State<Arc<OnceCell<MemgraphConnection>>>,
+    axum::Extension(user): axum::Extension<UserRecord>,
 ) -> Result<Json<Vec<String>>, StatusCode> {
     let conn = get_connection(&conn_cell).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let files = conn.get_all_file_paths().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let files = conn.get_all_file_paths(&user.tenant_id).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(files))
 }
 
 async fn handle_historical_engrams(
     State(conn_cell): State<Arc<OnceCell<MemgraphConnection>>>,
+    axum::Extension(user): axum::Extension<UserRecord>,
     Query(query): Query<FilePathQuery>,
 ) -> Result<Json<Vec<String>>, StatusCode> {
     let conn = get_connection(&conn_cell).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let solutions = conn.get_historical_engram_solutions(&query.file_path)
+    let solutions = conn.get_historical_engram_solutions(&user.tenant_id, &query.file_path)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(solutions))
@@ -688,10 +818,11 @@ async fn handle_historical_engrams(
 
 async fn handle_get_lessons(
     State(conn_cell): State<Arc<OnceCell<MemgraphConnection>>>,
+    axum::Extension(user): axum::Extension<UserRecord>,
     Query(query): Query<LessonsQuery>,
 ) -> Result<Json<Vec<ozymem_core::LessonRecord>>, StatusCode> {
     let conn = get_connection(&conn_cell).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let lessons = conn.get_recent_lessons(query.limit, query.file_filter)
+    let lessons = conn.get_recent_lessons(&user.tenant_id, query.limit, query.file_filter)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(lessons))
@@ -699,10 +830,11 @@ async fn handle_get_lessons(
 
 async fn handle_outgoing_dependencies(
     State(conn_cell): State<Arc<OnceCell<MemgraphConnection>>>,
+    axum::Extension(user): axum::Extension<UserRecord>,
     Query(query): Query<FilePathQuery>,
 ) -> Result<Json<Vec<String>>, StatusCode> {
     let conn = get_connection(&conn_cell).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let deps = conn.get_outgoing_dependencies(&query.file_path)
+    let deps = conn.get_outgoing_dependencies(&user.tenant_id, &query.file_path)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(deps))
@@ -710,10 +842,11 @@ async fn handle_outgoing_dependencies(
 
 async fn handle_incoming_dependencies(
     State(conn_cell): State<Arc<OnceCell<MemgraphConnection>>>,
+    axum::Extension(user): axum::Extension<UserRecord>,
     Query(query): Query<FilePathQuery>,
 ) -> Result<Json<Vec<String>>, StatusCode> {
     let conn = get_connection(&conn_cell).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let deps = conn.get_incoming_dependencies(&query.file_path)
+    let deps = conn.get_incoming_dependencies(&user.tenant_id, &query.file_path)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(deps))
@@ -721,10 +854,11 @@ async fn handle_incoming_dependencies(
 
 async fn handle_file_context(
     State(conn_cell): State<Arc<OnceCell<MemgraphConnection>>>,
+    axum::Extension(user): axum::Extension<UserRecord>,
     Query(query): Query<FilePathQuery>,
 ) -> Result<Json<Option<ozymem_core::FileGraphContext>>, StatusCode> {
     let conn = get_connection(&conn_cell).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let ctx = conn.get_file_context(&query.file_path)
+    let ctx = conn.get_file_context(&user.tenant_id, &query.file_path)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(ctx))
@@ -732,22 +866,25 @@ async fn handle_file_context(
 
 async fn handle_graph_summary(
     State(conn_cell): State<Arc<OnceCell<MemgraphConnection>>>,
+    axum::Extension(user): axum::Extension<UserRecord>,
 ) -> Result<Json<ozymem_core::GraphSummary>, StatusCode> {
     let conn = get_connection(&conn_cell).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let summary = conn.get_graph_summary().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let summary = conn.get_graph_summary(&user.tenant_id).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(summary))
 }
 
 async fn handle_find_symbol(
     State(conn_cell): State<Arc<OnceCell<MemgraphConnection>>>,
+    axum::Extension(user): axum::Extension<UserRecord>,
     Query(query): Query<FindSymbolQuery>,
 ) -> Result<Json<Vec<String>>, StatusCode> {
     let conn = get_connection(&conn_cell).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let query_str = "MATCH (f:File)-[:CONTAINS]->(fn:Function) \
-                     WHERE fn.name = $symbol_name AND f.path STARTS WITH $project_path \
+                     WHERE f.tenant_id = $tenant_id AND fn.name = $symbol_name AND f.path STARTS WITH $project_path \
                      RETURN f.path AS path, fn.start_line AS start_line";
     let mut query_result = conn.graph().execute(
         neo4rs::query(query_str)
+            .param("tenant_id", user.tenant_id.as_str())
             .param("symbol_name", query.symbol_name.as_str())
             .param("project_path", query.project_path.as_str())
     ).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -759,4 +896,105 @@ async fn handle_find_symbol(
         }
     }
     Ok(Json(results))
+}
+
+async fn handle_create_user(
+    State(conn_cell): State<Arc<OnceCell<MemgraphConnection>>>,
+    axum::Extension(user): axum::Extension<UserRecord>,
+    Json(input): Json<CreateUserRequest>,
+) -> Result<Json<Value>, StatusCode> {
+    if user.role != "Lead" {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let conn = get_connection(&conn_cell).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    
+    use rand::RngCore;
+    let mut token_bytes = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut token_bytes);
+    let user_token_hex: String = token_bytes.iter().map(|b| format!("{:02x}", b)).collect();
+    
+    conn.create_user(&user.tenant_id, &input.username, &input.role, &user_token_hex)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        
+    let combined_credential = format!("ozy_partner_ctx_{}_usr_{}", user.tenant_id, user_token_hex);
+    
+    Ok(Json(json!({
+        "username": input.username,
+        "role": input.role,
+        "credential": combined_credential,
+    })))
+}
+
+async fn handle_gpr_push(
+    State(conn_cell): State<Arc<OnceCell<MemgraphConnection>>>,
+    axum::Extension(user): axum::Extension<UserRecord>,
+    Json(input): Json<GprPushRequest>,
+) -> Result<Json<Value>, StatusCode> {
+    let conn = get_connection(&conn_cell).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if user.role == "Lead" {
+        for file_map in &input.files {
+            conn.save_file_definition(&user.tenant_id, file_map)
+                .await
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        }
+        Ok(Json(json!({ "status": "merged" })))
+    } else {
+        let gpr_id = conn.create_gpr_batch(&user.tenant_id, &user.name, &input.message, &input.files)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        Ok(Json(json!({ "status": "pending", "gpr_id": gpr_id })))
+    }
+}
+
+async fn handle_gpr_list(
+    State(conn_cell): State<Arc<OnceCell<MemgraphConnection>>>,
+    axum::Extension(user): axum::Extension<UserRecord>,
+) -> Result<Json<Vec<ozymem_core::GprRecord>>, StatusCode> {
+    if user.role != "Lead" {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let conn = get_connection(&conn_cell).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let list = conn.get_pending_gprs(&user.tenant_id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(list))
+}
+
+async fn handle_gpr_diff(
+    State(conn_cell): State<Arc<OnceCell<MemgraphConnection>>>,
+    axum::Extension(user): axum::Extension<UserRecord>,
+    Query(query): Query<GprDiffQuery>,
+) -> Result<Json<Value>, StatusCode> {
+    if user.role != "Lead" {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let conn = get_connection(&conn_cell).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    match conn.get_gpr_diff(&user.tenant_id, query.gpr_id).await {
+        Ok(Some((message, user, files, lessons))) => {
+            Ok(Json(json!({
+                "message": message,
+                "user": user,
+                "files": files,
+                "lessons": lessons,
+            })))
+        }
+        Ok(None) => Err(StatusCode::NOT_FOUND),
+        Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+async fn handle_gpr_merge(
+    State(conn_cell): State<Arc<OnceCell<MemgraphConnection>>>,
+    axum::Extension(user): axum::Extension<UserRecord>,
+    Json(input): Json<GprMergeRequest>,
+) -> Result<StatusCode, StatusCode> {
+    if user.role != "Lead" {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let conn = get_connection(&conn_cell).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    conn.merge_gpr(&user.tenant_id, input.gpr_id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(StatusCode::OK)
 }
