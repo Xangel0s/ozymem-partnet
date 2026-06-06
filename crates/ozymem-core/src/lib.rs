@@ -1,8 +1,10 @@
 use anyhow::Context;
-use neo4rs::{query, ConfigBuilder, Graph};
+use neo4rs::{query, ConfigBuilder, Graph, BoltList, BoltMap, BoltType};
 use ozymem_parser::{FileDefinitionMap, SymbolKind, ParseStrategy, ExtractedFunction};
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+pub mod mcp_common;
 
 pub struct MemgraphConfig {
     pub uri: String,
@@ -102,7 +104,12 @@ impl MemgraphConnection {
             .await
             .with_context(|| format!("failed to connect to Memgraph at {}", config.uri))?;
 
-        Ok(Self { graph })
+        let connection = Self { graph };
+        // Garantizar índices en Memgraph para búsquedas veloces con UNWIND
+        let _ = connection.graph.run(query("CREATE INDEX ON :File(path)")).await;
+        let _ = connection.graph.run(query("CREATE INDEX ON :Function(name)")).await;
+
+        Ok(connection)
     }
 
     pub async fn ping(&self) -> anyhow::Result<i64> {
@@ -117,11 +124,16 @@ impl MemgraphConnection {
 
     // IAM Multitenant Methods
     pub async fn verify_token(&self, server_uuid: &str, user_token: &str) -> anyhow::Result<Option<UserRecord>> {
+        use sha2::{Sha256, Digest};
+        let mut hasher = Sha256::new();
+        hasher.update(user_token.as_bytes());
+        let hashed_token = hex::encode(hasher.finalize());
+
         let q = query(
             "MATCH (u:User {token: $token})-[:BELONGS_TO]->(t:Tenant {id: $tenant_id})\n\
              RETURN u.name AS name, u.role AS role, t.id AS tenant_id"
         )
-        .param("token", user_token)
+        .param("token", hashed_token)
         .param("tenant_id", server_uuid);
 
         let mut result = self.graph.execute(q).await?;
@@ -146,6 +158,11 @@ impl MemgraphConnection {
     }
 
     pub async fn create_user(&self, tenant_id: &str, username: &str, role: &str, token: &str) -> anyhow::Result<()> {
+        use sha2::{Sha256, Digest};
+        let mut hasher = Sha256::new();
+        hasher.update(token.as_bytes());
+        let hashed_token = hex::encode(hasher.finalize());
+
         let q = query(
             "MATCH (t:Tenant {id: $tenant_id})\n\
              MERGE (u:User {name: $username})\n\
@@ -155,7 +172,7 @@ impl MemgraphConnection {
         .param("tenant_id", tenant_id)
         .param("username", username)
         .param("role", role)
-        .param("token", token);
+        .param("token", hashed_token);
         self.graph.run(q).await?;
         Ok(())
     }
@@ -180,37 +197,39 @@ impl MemgraphConnection {
     }
 
     pub async fn save_file_definition(&self, tenant_id: &str, file_map: &FileDefinitionMap) -> anyhow::Result<()> {
-        let file_query = query("MERGE (f:File {path: $path, tenant_id: $tenant_id})\nSET f.language = $language")
-            .param("path", file_map.file_path.as_str())
-            .param("language", file_map.language.as_str())
-            .param("tenant_id", tenant_id);
-
-        self.graph.run(file_query).await?;
-
+        let mut fn_list = BoltList::new();
         for function in &file_map.functions {
-            let function_query = query(
-                "MATCH (f:File {path: $path, tenant_id: $tenant_id})\n\
-                 MERGE (fn:Function {name: $name, start_line: $start, end_line: $end, tenant_id: $tenant_id})\n\
-                 SET fn.strategy = $strategy,\n    fn.kind = $kind\n\
-                 MERGE (f)-[:CONTAINS]->(fn)",
-            )
-            .param("path", file_map.file_path.as_str())
-            .param("name", function.name.as_str())
-            .param("start", function.start_line as i64)
-            .param("end", function.end_line as i64)
-            .param("strategy", file_map.strategy.as_str())
-            .param("tenant_id", tenant_id)
-            .param(
-                "kind",
-                match function.kind {
-                    SymbolKind::Function => "Function",
-                    SymbolKind::Class => "Class",
-                },
-            );
-
-            self.graph.run(function_query).await?;
+            let mut fn_map = BoltMap::new();
+            fn_map.put("name".into(), function.name.as_str().into());
+            fn_map.put("start_line".into(), (function.start_line as i64).into());
+            fn_map.put("end_line".into(), (function.end_line as i64).into());
+            fn_map.put("strategy".into(), file_map.strategy.as_str().into());
+            fn_map.put("kind".into(), match function.kind {
+                SymbolKind::Function => "Function",
+                SymbolKind::Class => "Class",
+            }.into());
+            fn_list.push(BoltType::Map(fn_map));
         }
 
+        let unwind_query = query(
+            "MERGE (f:File {path: $path, tenant_id: $tenant_id})\n\
+             SET f.language = $language\n\
+             WITH f\n\
+             OPTIONAL MATCH (f)-[:CONTAINS]->(old_fn:Function)\n\
+             DETACH DELETE old_fn\n\
+             WITH f\n\
+             UNWIND $functions AS fn_data\n\
+             MERGE (fn:Function {name: fn_data.name, start_line: fn_data.start_line, end_line: fn_data.end_line, tenant_id: $tenant_id})\n\
+             SET fn.strategy = fn_data.strategy,\n\
+                 fn.kind = fn_data.kind\n\
+             MERGE (f)-[:CONTAINS]->(fn)"
+        )
+        .param("path", file_map.file_path.as_str())
+        .param("language", file_map.language.as_str())
+        .param("tenant_id", tenant_id)
+        .param("functions", BoltType::List(fn_list));
+
+        self.graph.run(unwind_query).await?;
         Ok(())
     }
 
@@ -1026,4 +1045,194 @@ pub fn default_memgraph_uri() -> &'static str {
 
 pub fn default_memgraph_database() -> &'static str {
     "memgraph"
+}
+
+// --- SOPORTE DE SESIONES, HEARTBEAT Y OBSERVABILIDAD ---
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionRecord {
+    pub id: String,
+    pub username: String,
+    pub role: String,
+    pub transport: String,
+    pub pid: i64,
+    pub started_at: String,
+    pub last_seen: String,
+}
+
+fn is_pid_alive(pid: i64) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        use std::process::Command;
+        if let Ok(output) = Command::new("tasklist")
+            .args(&["/FI", &format!("PID eq {}", pid), "/NH"])
+            .output()
+        {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            stdout.contains(&pid.to_string())
+        } else {
+            true
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        use std::process::Command;
+        let mut system = Command::new("kill");
+        system.arg("-0").arg(pid.to_string());
+        if let Ok(status) = system.status() {
+            status.success()
+        } else {
+            true
+        }
+    }
+}
+
+impl MemgraphConnection {
+    pub async fn register_session(
+        &self,
+        tenant_id: &str,
+        username: &str,
+        role: &str,
+        transport: &str,
+    ) -> anyhow::Result<String> {
+        use rand::RngCore;
+        let mut session_bytes = [0u8; 8];
+        rand::thread_rng().fill_bytes(&mut session_bytes);
+        let session_id = session_bytes.iter().map(|b| format!("{:02x}", b)).collect::<String>();
+
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context("system clock error")?
+            .as_secs();
+
+        let pid = std::process::id() as i64;
+
+        let q = query(
+            "CREATE (s:Session {id: $id, username: $username, role: $role, transport: $transport, pid: $pid, started_at: $started_at, last_seen: $last_seen, tenant_id: $tenant_id})"
+        )
+        .param("id", session_id.clone())
+        .param("username", username)
+        .param("role", role)
+        .param("transport", transport)
+        .param("pid", pid)
+        .param("started_at", timestamp.to_string())
+        .param("last_seen", timestamp.to_string())
+        .param("tenant_id", tenant_id);
+
+        self.graph.run(q).await?;
+        Ok(session_id)
+    }
+
+    pub async fn update_session_heartbeat(
+        &self,
+        tenant_id: &str,
+        session_id: &str,
+    ) -> anyhow::Result<()> {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context("system clock error")?
+            .as_secs();
+
+        let q = query(
+            "MATCH (s:Session {id: $id, tenant_id: $tenant_id})\n\
+             SET s.last_seen = $last_seen"
+        )
+        .param("id", session_id)
+        .param("last_seen", timestamp.to_string())
+        .param("tenant_id", tenant_id);
+
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
+    pub async fn clean_zombie_sessions(&self, tenant_id: &str) -> anyhow::Result<()> {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context("system clock error")?
+            .as_secs();
+
+        let q = query(
+            "MATCH (s:Session {tenant_id: $tenant_id})\n\
+             RETURN s.id AS id, s.pid AS pid, s.last_seen AS last_seen"
+        )
+        .param("tenant_id", tenant_id);
+
+        let mut result = self.graph.execute(q).await?;
+        let mut to_delete = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            let id: String = row.get("id")?;
+            let pid: i64 = row.get("pid")?;
+            let last_seen_str: String = row.get("last_seen")?;
+            let last_seen = last_seen_str.parse::<u64>().unwrap_or(0);
+
+            if timestamp > last_seen + 60 {
+                to_delete.push(id.clone());
+                continue;
+            }
+
+            if !is_pid_alive(pid) {
+                to_delete.push(id);
+            }
+        }
+
+        for id in to_delete {
+            let del_q = query("MATCH (s:Session {id: $id, tenant_id: $tenant_id}) DETACH DELETE s")
+                .param("id", id)
+                .param("tenant_id", tenant_id);
+            let _ = self.graph.run(del_q).await;
+        }
+
+        Ok(())
+    }
+
+    pub async fn get_active_sessions(&self, tenant_id: &str) -> anyhow::Result<Vec<SessionRecord>> {
+        let _ = self.clean_zombie_sessions(tenant_id).await;
+
+        let q = query(
+            "MATCH (s:Session {tenant_id: $tenant_id})\n\
+             RETURN s.id AS id, s.username AS username, s.role AS role, s.transport AS transport, s.pid AS pid, s.started_at AS started_at, s.last_seen AS last_seen\n\
+             ORDER BY s.started_at DESC"
+        )
+        .param("tenant_id", tenant_id);
+
+        let mut result = self.graph.execute(q).await?;
+        let mut list = Vec::new();
+        while let Some(row) = result.next().await? {
+            list.push(SessionRecord {
+                id: row.get("id")?,
+                username: row.get("username")?,
+                role: row.get("role")?,
+                transport: row.get("transport")?,
+                pid: row.get("pid")?,
+                started_at: row.get("started_at")?,
+                last_seen: row.get("last_seen")?,
+            });
+        }
+        Ok(list)
+    }
+
+    pub async fn kick_session(&self, tenant_id: &str, session_id: &str) -> anyhow::Result<bool> {
+        let mut check = self.graph.execute(
+            query("MATCH (s:Session {id: $id, tenant_id: $tenant_id}) RETURN count(s) AS count")
+                .param("id", session_id)
+                .param("tenant_id", tenant_id)
+        ).await?;
+        
+        let count: i64 = if let Some(row) = check.next().await? {
+            row.get("count")?
+        } else {
+            0
+        };
+
+        if count == 0 {
+            return Ok(false);
+        }
+
+        let q = query("MATCH (s:Session {id: $id, tenant_id: $tenant_id}) DETACH DELETE s")
+            .param("id", session_id)
+            .param("tenant_id", tenant_id);
+        self.graph.run(q).await?;
+        Ok(true)
+    }
 }

@@ -491,21 +491,71 @@ fn extract_identifier(fragment: &str) -> String {
 fn find_brace_block_end(lines: &[&str], start_index: usize) -> usize {
     let mut depth = 0usize;
     let mut seen_open = false;
+    let mut in_string = false;
+    let mut string_char = '"';
+    let mut in_block_comment = false;
 
     for (index, line) in lines.iter().enumerate().skip(start_index) {
-        for character in line.chars() {
-            match character {
-                '{' => {
-                    depth += 1;
-                    seen_open = true;
+        let chars: Vec<char> = line.chars().collect();
+        let mut i = 0;
+
+        while i < chars.len() {
+            let character = chars[i];
+
+            if in_block_comment {
+                if character == '*' && i + 1 < chars.len() && chars[i + 1] == '/' {
+                    in_block_comment = false;
+                    i += 2;
+                } else {
+                    i += 1;
                 }
-                '}' => {
-                    if depth > 0 {
-                        depth -= 1;
+                continue;
+            }
+
+            if in_string {
+                if character == string_char {
+                    let mut backslash_count = 0;
+                    let mut temp = i as i64 - 1;
+                    while temp >= 0 && chars[temp as usize] == '\\' {
+                        backslash_count += 1;
+                        temp -= 1;
+                    }
+                    if backslash_count % 2 == 0 {
+                        in_string = false;
                     }
                 }
-                _ => {}
+                i += 1;
+                continue;
             }
+
+            if character == '/' && i + 1 < chars.len() && chars[i + 1] == '/' {
+                break;
+            }
+            if character == '#' {
+                break;
+            }
+            if character == '/' && i + 1 < chars.len() && chars[i + 1] == '*' {
+                in_block_comment = true;
+                i += 2;
+                continue;
+            }
+
+            if character == '"' || character == '\'' {
+                in_string = true;
+                string_char = character;
+                i += 1;
+                continue;
+            }
+
+            if character == '{' {
+                depth += 1;
+                seen_open = true;
+            } else if character == '}' {
+                if depth > 0 {
+                    depth -= 1;
+                }
+            }
+            i += 1;
         }
 
         if seen_open && depth == 0 {
@@ -660,6 +710,19 @@ use ozymem_core::MemgraphConnection;
         assert!(is_binary_file(std::path::Path::new("image.png")));
         assert!(!is_binary_file(std::path::Path::new("source.rs")));
         assert!(!is_binary_file(std::path::Path::new("script.py")));
+    }
+
+    #[test]
+    fn parses_braces_ignoring_strings_and_comments() {
+        let source = r#"func test_escapes() {
+            let s = "brace } inside string"; // a comment with { open brace
+            /* block comment with } close brace */
+            let s2 = "escaped \" quotes }";
+        }
+"#;
+        let lines: Vec<&str> = source.lines().collect();
+        let end = find_brace_block_end(&lines, 0);
+        assert_eq!(end, 5);
     }
 }
 

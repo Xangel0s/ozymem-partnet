@@ -173,6 +173,14 @@ enum Commands {
         #[command(subcommand)]
         subcommand: GprSubcommand,
     },
+    Auth {
+        #[command(subcommand)]
+        subcommand: AuthSubcommand,
+    },
+    Session {
+        #[command(subcommand)]
+        subcommand: SessionSubcommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -206,6 +214,20 @@ pub enum GprSubcommand {
     },
     Merge {
         gpr_id: i64,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AuthSubcommand {
+    #[command(name = "reset-token")]
+    ResetToken,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SessionSubcommand {
+    List,
+    Kick {
+        session_id: String,
     },
 }
 
@@ -629,6 +651,45 @@ impl BackendClient {
                     Ok(cred.to_string())
                 } else {
                     Err(anyhow::anyhow!("Remote team create failed: status {}", resp.status()))
+                }
+            }
+        }
+    }
+
+    pub async fn get_active_sessions(&self) -> anyhow::Result<Vec<ozymem_core::SessionRecord>> {
+        match &self.mode {
+            BackendMode::Local(conn) => conn.get_active_sessions(&self.tenant_id()).await,
+            BackendMode::Remote { url, token, client } => {
+                let resp = client.get(format!("{}/api/sessions", url))
+                    .header("Authorization", format!("Bearer {}", token))
+                    .send()
+                    .await?;
+                if resp.status().is_success() {
+                    let list: Vec<ozymem_core::SessionRecord> = resp.json().await?;
+                    Ok(list)
+                } else {
+                    Err(anyhow::anyhow!("Remote get sessions failed: status {}", resp.status()))
+                }
+            }
+        }
+    }
+
+    pub async fn kick_session(&self, session_id: &str) -> anyhow::Result<bool> {
+        match &self.mode {
+            BackendMode::Local(conn) => conn.kick_session(&self.tenant_id(), session_id).await,
+            BackendMode::Remote { url, token, client } => {
+                let resp = client.post(format!("{}/api/sessions/kick", url))
+                    .header("Authorization", format!("Bearer {}", token))
+                    .json(&serde_json::json!({
+                        "session_id": session_id,
+                    }))
+                    .send()
+                    .await?;
+                if resp.status().is_success() {
+                    let val: serde_json::Value = resp.json().await?;
+                    Ok(val.get("kicked").and_then(serde_json::Value::as_bool).unwrap_or(false))
+                } else {
+                    Err(anyhow::anyhow!("Remote kick session failed: status {}", resp.status()))
                 }
             }
         }
@@ -1279,6 +1340,26 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
+        Commands::Auth { subcommand } => {
+            match subcommand {
+                AuthSubcommand::ResetToken => {
+                    run_auth_reset_token().await?;
+                    return Ok(());
+                }
+            }
+        }
+        Commands::Session { subcommand } => {
+            match subcommand {
+                SessionSubcommand::List => {
+                    run_session_list().await?;
+                    return Ok(());
+                }
+                SessionSubcommand::Kick { session_id } => {
+                    run_session_kick(session_id.clone()).await?;
+                    return Ok(());
+                }
+            }
+        }
         _ => {}
     }
 
@@ -1337,6 +1418,8 @@ async fn main() -> anyhow::Result<()> {
         Commands::Doctor { .. } => unreachable!(),
         Commands::Team { .. } => unreachable!(),
         Commands::Gpr { .. } => unreachable!(),
+        Commands::Auth { .. } => unreachable!(),
+        Commands::Session { .. } => unreachable!(),
     }
 
     Ok(())
@@ -4047,5 +4130,169 @@ async fn run_doctor(json_output: bool) -> anyhow::Result<()> {
     }
     println!("=========================================");
 
+    Ok(())
+}
+
+async fn run_auth_reset_token() -> anyhow::Result<()> {
+    use dialoguer::Confirm;
+    
+    println!("=========================================================");
+    println!("        RESTABLECER TOKEN DE ACCESO DE OZYMEM            ");
+    println!("=========================================================");
+    println!();
+    
+    if !Confirm::with_theme(&dialoguer::theme::ColorfulTheme::default())
+        .with_prompt("¿Estás seguro de que deseas restablecer tu token de acceso? Esto invalidará el token actual.")
+        .default(false)
+        .interact()?
+    {
+        println!("Operación cancelada.");
+        return Ok(());
+    }
+
+    let (config_path, mut config) = load_config()?;
+    let current_token = config.token.clone().unwrap_or_else(|| "ozys_8f7e_8f7e50d578a699177eba16c7".to_string());
+    
+    let server_uuid = if current_token.starts_with("ozy_partner_ctx_") && current_token.contains("_usr_") {
+        let trimmed = &current_token["ozy_partner_ctx_".len()..];
+        let parts: Vec<&str> = trimmed.split("_usr_").collect();
+        parts[0].to_string()
+    } else {
+        let mut u_bytes = [0u8; 8];
+        use rand::RngCore;
+        rand::thread_rng().fill_bytes(&mut u_bytes);
+        u_bytes.iter().map(|b| format!("{:02x}", b)).collect::<String>()
+    };
+
+    let new_token_hex = {
+        let mut b = [0u8; 16];
+        use rand::RngCore;
+        rand::thread_rng().fill_bytes(&mut b);
+        b.iter().map(|byte| format!("{:02x}", byte)).collect::<String>()
+    };
+
+    let new_credential = format!("ozy_partner_ctx_{}_usr_{}", server_uuid, new_token_hex);
+
+    let connection = build_backend_client().await?;
+    match &connection.mode {
+        BackendMode::Local(conn) => {
+            conn.create_user(&server_uuid, "admin", "admin", &new_token_hex).await?;
+            println!("[INFO] Credencial actualizada en la base de datos local.");
+        }
+        BackendMode::Remote { .. } => {
+            println!("[WARNING] Tu CLI está configurada en modo remoto. El restablecimiento local de tokens no afectará al servidor remoto.");
+        }
+    }
+
+    config.token = Some(new_credential.clone());
+    save_config(&config_path, &config)?;
+    println!("[SUCCESS] Configuración local (.ozymem.toml) actualizada.");
+
+    if let Err(e) = run_mcp_setup().await {
+        println!("[WARNING] No se pudo actualizar automáticamente mcp_config.json: {:?}", e);
+    } else {
+        println!("[SUCCESS] Archivos de configuración de clientes MCP (Cursor/VS Code/Claude) actualizados.");
+    }
+
+    let copied = copy_to_clipboard(&new_credential).is_ok();
+    println!();
+    println!("🔑 NUEVA CREDENCIAL UNIFICADA:");
+    println!("  {}", new_credential);
+    println!();
+    if copied {
+        println!("[INFO] La credencial ha sido copiada automáticamente al portapapeles.");
+    } else {
+        println!("[INFO] Por favor, copia la credencial unificada manualmente.");
+    }
+
+    Ok(())
+}
+
+fn copy_to_clipboard(text: &str) -> anyhow::Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        use std::process::{Command, Stdio};
+        use std::io::Write;
+        let mut child = Command::new("clip")
+            .stdin(Stdio::piped())
+            .spawn()?;
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(text.as_bytes())?;
+        }
+        child.wait()?;
+        Ok(())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        use std::process::{Command, Stdio};
+        use std::io::Write;
+        if let Ok(mut child) = Command::new("pbcopy").stdin(Stdio::piped()).spawn() {
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(text.as_bytes());
+            }
+            let _ = child.wait();
+        } else if let Ok(mut child) = Command::new("xclip").args(&["-selection", "clipboard"]).stdin(Stdio::piped()).spawn() {
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(text.as_bytes());
+            }
+            let _ = child.wait();
+        }
+        Ok(())
+    }
+}
+
+async fn run_session_list() -> anyhow::Result<()> {
+    let connection = build_backend_client().await?;
+    if let BackendMode::Local(ref conn) = connection.mode {
+        let _ = conn.clean_zombie_sessions(&connection.tenant_id()).await;
+    }
+
+    let sessions = connection.get_active_sessions().await?;
+    if sessions.is_empty() {
+        println!("[INFO] No hay sesiones activas registradas.");
+        return Ok(());
+    }
+
+    use comfy_table::Table;
+    let mut table = Table::new();
+    table.set_header(vec!["ID de Sesión", "Usuario", "Transporte", "PID", "Última Actividad (Heartbeat)"]);
+
+    for session in sessions {
+        let last_seen_dt = if let Ok(last_seen_secs) = session.last_seen.parse::<u64>() {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let diff = now.saturating_sub(last_seen_secs);
+            if diff < 60 {
+                format!("Hace {}s", diff)
+            } else {
+                format!("Hace {}m {}s", diff / 60, diff % 60)
+            }
+        } else {
+            "N/A".to_string()
+        };
+
+        table.add_row(vec![
+            session.id,
+            session.username,
+            session.transport,
+            session.pid.to_string(),
+            last_seen_dt,
+        ]);
+    }
+
+    println!("{}", table);
+    Ok(())
+}
+
+async fn run_session_kick(session_id: String) -> anyhow::Result<()> {
+    let connection = build_backend_client().await?;
+    let kicked = connection.kick_session(&session_id).await?;
+    if kicked {
+        println!("[SUCCESS] Sesión '{}' revocada con éxito.", session_id);
+    } else {
+        println!("[WARNING] No se encontró ninguna sesión activa con ID '{}'.", session_id);
+    }
     Ok(())
 }
