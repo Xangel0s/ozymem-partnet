@@ -4,6 +4,7 @@ use ozymem_parser::{FileDefinitionMap, SymbolKind, ParseStrategy, ExtractedFunct
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+pub mod fs_utils;
 pub mod mcp_common;
 
 pub struct MemgraphConfig {
@@ -122,28 +123,56 @@ impl MemgraphConnection {
         Ok(value)
     }
 
+    fn hash_token_with_salt(salt_hex: &str, token: &str) -> String {
+        use sha2::{Sha256, Digest};
+        let salt = hex::decode(salt_hex).unwrap_or_default();
+        let mut hasher = Sha256::new();
+        hasher.update(&salt);
+        hasher.update(token.as_bytes());
+        hex::encode(hasher.finalize())
+    }
+
+    fn generate_salted_token_hash(token: &str) -> String {
+        use rand::RngCore;
+        let mut salt = [0u8; 16];
+        rand::thread_rng().fill_bytes(&mut salt);
+        let salt_hex = hex::encode(salt);
+        let hash = Self::hash_token_with_salt(&salt_hex, token);
+        format!("{}:{}", salt_hex, hash)
+    }
+
     // IAM Multitenant Methods
     pub async fn verify_token(&self, server_uuid: &str, user_token: &str) -> anyhow::Result<Option<UserRecord>> {
-        use sha2::{Sha256, Digest};
-        let mut hasher = Sha256::new();
-        hasher.update(user_token.as_bytes());
-        let hashed_token = hex::encode(hasher.finalize());
-
         let q = query(
-            "MATCH (u:User {token: $token})-[:BELONGS_TO]->(t:Tenant {id: $tenant_id})\n\
-             RETURN u.name AS name, u.role AS role, t.id AS tenant_id"
+            "MATCH (u:User)-[:BELONGS_TO]->(t:Tenant {id: $tenant_id})\n\
+             RETURN u.name AS name, u.role AS role, u.token AS stored_token, t.id AS tenant_id"
         )
-        .param("token", hashed_token)
         .param("tenant_id", server_uuid);
 
         let mut result = self.graph.execute(q).await?;
         if let Some(row) = result.next().await? {
-            Ok(Some(UserRecord {
-                name: row.get("name")?,
-                role: row.get("role")?,
-                token: user_token.to_string(),
-                tenant_id: row.get("tenant_id")?,
-            }))
+            let stored_token: String = row.get("stored_token")?;
+            let parts: Vec<&str> = stored_token.splitn(2, ':').collect();
+            let is_valid = if parts.len() == 2 {
+                let expected_hash = Self::hash_token_with_salt(parts[0], user_token);
+                expected_hash == parts[1]
+            } else {
+                // Legacy unsalted hash fallback
+                use sha2::{Sha256, Digest};
+                let mut hasher = Sha256::new();
+                hasher.update(user_token.as_bytes());
+                hex::encode(hasher.finalize()) == stored_token
+            };
+            if is_valid {
+                Ok(Some(UserRecord {
+                    name: row.get("name")?,
+                    role: row.get("role")?,
+                    token: user_token.to_string(),
+                    tenant_id: row.get("tenant_id")?,
+                }))
+            } else {
+                Ok(None)
+            }
         } else {
             Ok(None)
         }
@@ -158,10 +187,7 @@ impl MemgraphConnection {
     }
 
     pub async fn create_user(&self, tenant_id: &str, username: &str, role: &str, token: &str) -> anyhow::Result<()> {
-        use sha2::{Sha256, Digest};
-        let mut hasher = Sha256::new();
-        hasher.update(token.as_bytes());
-        let hashed_token = hex::encode(hasher.finalize());
+        let hashed_token = Self::generate_salted_token_hash(token);
 
         let q = query(
             "MATCH (t:Tenant {id: $tenant_id})\n\
@@ -667,19 +693,11 @@ impl MemgraphConnection {
 
     // Graph Pull Requests (GPR) & Staging Methods
     pub async fn create_gpr(&self, tenant_id: &str, username: &str, message: &str, file_map: &FileDefinitionMap) -> anyhow::Result<i64> {
-        let timestamp = SystemTime::now()
+        let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .context("system clock is before UNIX_EPOCH")?
-            .as_secs()
-            .to_string();
-
-        let mut count_result = self.graph.execute(query("MATCH (g:GprRequest) RETURN count(g) AS gpr_count")).await?;
-        let gpr_count = if let Some(row) = count_result.next().await? {
-            row.get::<i64>("gpr_count")?
-        } else {
-            0
-        };
-        let gpr_id = gpr_count + 101;
+            .context("system clock is before UNIX_EPOCH")?;
+        let timestamp = ts.as_secs().to_string();
+        let gpr_id = (ts.as_micros() as i64).wrapping_add(rand::random::<i64>().wrapping_abs());
 
         let gpr_query = query(
             "CREATE (g:GprRequest {id: $id, user: $user, message: $message, timestamp: $timestamp, status: 'PENDING', tenant_id: $tenant_id})"
@@ -732,19 +750,11 @@ impl MemgraphConnection {
     }
 
     pub async fn create_gpr_batch(&self, tenant_id: &str, username: &str, message: &str, files: &[FileDefinitionMap]) -> anyhow::Result<i64> {
-        let timestamp = SystemTime::now()
+        let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .context("system clock is before UNIX_EPOCH")?
-            .as_secs()
-            .to_string();
-
-        let mut count_result = self.graph.execute(query("MATCH (g:GprRequest) RETURN count(g) AS gpr_count")).await?;
-        let gpr_count = if let Some(row) = count_result.next().await? {
-            row.get::<i64>("gpr_count")?
-        } else {
-            0
-        };
-        let gpr_id = gpr_count + 101;
+            .context("system clock is before UNIX_EPOCH")?;
+        let timestamp = ts.as_secs().to_string();
+        let gpr_id = (ts.as_micros() as i64).wrapping_add(rand::random::<i64>().wrapping_abs());
 
         let gpr_query = query(
             "CREATE (g:GprRequest {id: $id, user: $user, message: $message, timestamp: $timestamp, status: 'PENDING', tenant_id: $tenant_id})"
@@ -808,19 +818,11 @@ impl MemgraphConnection {
         error_context: &str,
         solution: &str,
     ) -> anyhow::Result<i64> {
-        let timestamp = SystemTime::now()
+        let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .context("system clock is before UNIX_EPOCH")?
-            .as_secs()
-            .to_string();
-
-        let mut count_result = self.graph.execute(query("MATCH (g:GprRequest) RETURN count(g) AS gpr_count")).await?;
-        let gpr_count = if let Some(row) = count_result.next().await? {
-            row.get::<i64>("gpr_count")?
-        } else {
-            0
-        };
-        let gpr_id = gpr_count + 101;
+            .context("system clock is before UNIX_EPOCH")?;
+        let timestamp = ts.as_secs().to_string();
+        let gpr_id = (ts.as_micros() as i64).wrapping_add(rand::random::<i64>().wrapping_abs());
 
         let gpr_query = query(
             "CREATE (g:GprRequest {id: $id, user: $user, message: $message, timestamp: $timestamp, status: 'PENDING', tenant_id: $tenant_id})"
