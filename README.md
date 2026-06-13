@@ -1,74 +1,101 @@
-# Ozymem-Partner 🚀
+# Ozymem-Partner
 
-Ozymem-Partner es un motor de análisis arquitectónico políglota y un servidor de engramas de memoria basado en grafos de conocimiento, diseñado especialmente para el trabajo colaborativo en equipos de desarrollo. Utiliza una arquitectura unificada que conecta múltiples terminales a un cerebro centralizado en la nube (ej. Coolify) o localmente.
+Ozymem-Partner es un motor de analisis arquitectonico poliglota y un servidor de engramas de memoria basado en grafos de conocimiento, disenado para el trabajo colaborativo en equipos de desarrollo. Utiliza una arquitectura unificada que conecta multiples terminales a un cerebro centralizado.
 
-## Características de Ozymem-Partner
+## Caracteristicas
 
-- **Arquitectura Colaborativa**: Si se configura con un host remoto HTTP/S, la CLI delega la persistencia del mapa de dependencias, definición de archivos y registro de lecciones (`record_lesson`) a través de APIs HTTP seguras.
-- **Cerebro Compartido**: Las lecciones aprendidas y soluciones de errores aplicadas por un desarrollador están disponibles de forma instantánea para el resto del equipo en sus respectivos IDEs (vía MCP).
-- **Multiplataforma Nativo**: Soporte certificado para Windows (PowerShell), Linux y macOS (Bash).
-- **Modo Offline/Local**: Sigue permitiendo la conexión por defecto vía Bolt a una base de datos Memgraph local en caso de desarrollo aislado.
+- **Arquitectura Colaborativa**: La CLI delega la persistencia del mapa de dependencias, definicion de archivos y registro de lecciones a traves de APIs HTTP seguras.
+- **Cerebro Compartido**: Las lecciones aprendidas y soluciones de errores aplicadas por un desarrollador estan disponibles de forma instantanea para el resto del equipo via MCP.
+- **Multiplataforma Nativo**: Soporte para Windows (PowerShell), Linux y macOS (Bash).
+- **Modo Offline/Local**: Conexion por defecto via Bolt a una base de datos Memgraph local.
+- **Seguridad**: Autenticacion por token, rate limiting por IP, body size limits, credenciales no hardcoded.
 
-## Requisitos previos
+## Requisitos
 
-Para poder ejecutar e instalar Ozymem-Partner localmente se requiere contar con:
+- Rust 1.75.0+ (cargo, rustc)
+- Docker (para Memgraph local o despliegue en produccion)
 
-- Rust (cargo, rustc en versión estable reciente)
-- Docker (solo si ejecutas Memgraph de forma local)
-
-## Instalación rápida
+## Instalacion Rapida
 
 ### Windows (PowerShell)
-Abre PowerShell en la raíz del monorepo y ejecuta:
 ```powershell
 Set-ExecutionPolicy Bypass -Scope Process -Force
 .\init-ozymem.ps1
 ```
 
 ### Linux / macOS (Bash)
-Abre tu terminal favorita y ejecuta:
 ```bash
 chmod +x init-ozymem.sh
 ./init-ozymem.sh
 ```
 
-## Configuración Colaborativa (`.ozymem.toml`)
+## Variables de Entorno
 
-Para conectar tu CLI al cerebro centralizado de tu equipo, edita el archivo `.ozymem.toml` ubicado en tu carpeta de usuario (Home):
+| Variable | Requerida | Default | Descripcion |
+|----------|-----------|---------|-------------|
+| `MEMGRAPH_USER` | Si | - | Usuario de Memgraph |
+| `MEMGRAPH_PASSWORD` | Si | - | Password de Memgraph |
+| `MEMGRAPH_URI` | No | `127.0.0.1:7687` | URI de conexion a Memgraph |
+| `MEMGRAPH_DATABASE` | No | `memgraph` | Nombre de la base de datos |
+| `PORT` | No | `8080` | Puerto del servidor HTTP |
+| `OZYMEM_SERVER_MODE` | No | `web` | Modo del servidor (`web` o `stdio`) |
 
-```toml
-current_brain = "central_brain"
-token = "tu-token-seguro-mcp"
+Ver `.env.example` para la lista completa.
 
-[brains.central_brain]
-host = "https://tu-instancia-coolify.com"
-port = 443
-```
+## Comandos CLI
 
-Si el host comienza con `http://` o `https://`, la CLI cambiará de inmediato al modo colaborativo HTTP/S autenticado mediante token.
+| Comando | Descripcion |
+|---------|-------------|
+| `ozymem scan <dir>` | Escanea un directorio e indexa archivos |
+| `ozymem status` | Muestra estado de watchers y metricas del grafo |
+| `ozymem lessons --limit N` | Lista lecciones aprendidas |
+| `ozymem tree <archivo> --depth N` | Arbol de dependencias |
+| `ozymem trace <archivo>` | Analisis de impacto reverso |
+| `ozymem watch <dir>` | Monitoreo continuo de cambios |
+| `ozymem doctor` | Diagnostico del entorno |
+| `ozymem gpr push/list/diff/merge` | Graph Pull Requests |
+| `ozymem team create` | Gestion de usuarios |
+| `ozymem session list/kick` | Gestion de sesiones |
 
-## Uso de la CLI
+## Docker
 
-Una vez instalado, la herramienta global `ozymem` te permite escanear proyectos, registrar lecciones e inspeccionar dependencias:
-
-* **Escanear código**: `ozymem scan <directorio>` (agrega `--reset` para limpiar el grafo actual).
-* **Ver estado**: `ozymem status` (muestra la topología del grafo y estado de los watchers de proyectos).
-* **Bitácora de Lecciones**: `ozymem lessons --limit 10` para leer soluciones aplicadas por el equipo.
-* **Árbol de Dependencias**: `ozymem tree <archivo> --depth 2`.
-* **Limpiar archivo del grafo**: `ozymem clean --path <archivo>`.
-
-## Servidor MCP y Backend HTTP
-
-Para usar Ozymem-Partner en tu IDE (Cursor o Claude Desktop) o levantar el backend que servirá de API centralizada al equipo:
-
-### Servidor MCP Local (Stdio)
+### Desarrollo
 ```bash
-cargo run -p ozymem-server
+docker compose up -d
 ```
 
-### Backend API Colaborativo (Modo Web)
-Para arrancar el backend en la nube que recibe las sincronizaciones:
+### Produccion
 ```bash
-cargo run -p ozymem-server -- --web
+# Copiar .env.example a .env y configurar credenciales
+cp .env.example .env
+docker compose -f docker-compose.prod.yml up -d
 ```
-*(O configurando la variable de entorno `OZYMEM_SERVER_MODE=web`)*.
+
+## Arquitectura
+
+```
+crates/
+  ozymem-core/     # Capa de base de datos (Memgraph) y logica central
+  ozymem-parser/   # Parsers multi-lenguaje (Tree-sitter)
+  ozymem-cli/      # CLI principal
+  ozymem-server/   # Servidor MCP stdio y HTTP API
+```
+
+## Seguridad
+
+- **Sin credenciales hardcoded**: Las variables `MEMGRAPH_USER` y `MEMGRAPH_PASSWORD` son obligatorias.
+- **Rate limiting por IP**: 100 requests por 60 segundos por cliente.
+- **Body size limit**: Maximo 10MB por request.
+- **Tokens con salt**: SHA-256 con salt aleatorio, sin fallback legacy.
+- **Health check**: Endpoint `/api/health` para monitoreo.
+
+## Testing
+
+```bash
+cargo test --workspace     # Ejecutar todos los tests
+cargo clippy --workspace   # Verificar calidad de codigo
+```
+
+## Licencia
+
+MIT

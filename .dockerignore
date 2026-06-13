@@ -1,0 +1,42 @@
+# Git
+.git
+.gitignore
+
+# Build artifacts
+target/
+*.exe
+*.pdb
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Documentation (not needed in container)
+docs/
+*.md
+!README.md
+
+# Docker files (avoid recursive builds)
+Dockerfile
+docker-compose*.yml
+.dockerignore
+
+# Environment files (should be passed via environment variables)
+.env
+.env.*
+!.env.example
+
+# Scripts (not needed in container)
+*.ps1
+*.sh
+
+# Lock files (Cargo.lock should be committed for binaries)
+# But we exclude it here to force fresh dependency resolution
+Cargo.lock

@@ -1,7 +1,7 @@
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use ozymem_core::{
-    default_memgraph_database, default_memgraph_uri, fs_utils, FileGraphContext, GraphSummary,
+    default_memgraph_database, default_memgraph_uri, fs_utils, is_pid_alive, FileGraphContext, GraphSummary,
     LessonRecord, MemgraphConfig, MemgraphConnection, StoredFunction,
 };
 use ozymem_parser::{
@@ -256,7 +256,7 @@ impl BackendClient {
                         let (_, cfg) = load_config().ok()?;
                         cfg.token
                     })
-                    .unwrap_or_else(|| String::new())
+                    .unwrap_or_default()
             }
             BackendMode::Remote { token, .. } => token.clone(),
         };
@@ -622,7 +622,7 @@ impl BackendClient {
                         let (_, cfg) = load_config().ok()?;
                         cfg.token
                     })
-                    .unwrap_or_else(|| String::new());
+                    .unwrap_or_default();
                 
                 let tenant_id = if token.starts_with("ozy_partner_ctx_") && token.contains("_usr_") {
                     let trimmed = &token["ozy_partner_ctx_".len()..];
@@ -1228,6 +1228,14 @@ mod mcp;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Initialize tracing - default to warn level for CLI (less verbose)
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
+        .init();
+
     let args = Args::parse();
 
     match &args.command {
@@ -1406,7 +1414,7 @@ pub async fn build_backend_client() -> anyhow::Result<BackendClient> {
     };
 
     let host = host_env.unwrap_or_else(|| config.current_brain.clone());
-    let token = token_env.unwrap_or_else(|| String::new());
+    let token = token_env.unwrap_or_default();
 
     if host.starts_with("http://") || host.starts_with("https://") {
         let client = reqwest::Client::new();
@@ -1425,8 +1433,10 @@ pub async fn build_backend_client() -> anyhow::Result<BackendClient> {
         };
         let memgraph_config = MemgraphConfig {
             uri: if host_str.contains(':') { host_str } else { format!("{}:{}", host_str, port) },
-            user: std::env::var("MEMGRAPH_USER").unwrap_or_else(|_| "admin".to_string()),
-            password: std::env::var("MEMGRAPH_PASSWORD").unwrap_or_else(|_| "admin".to_string()),
+            user: std::env::var("MEMGRAPH_USER")
+                .expect("MEMGRAPH_USER environment variable is required. Set it to your Memgraph username."),
+            password: std::env::var("MEMGRAPH_PASSWORD")
+                .expect("MEMGRAPH_PASSWORD environment variable is required. Set it to your Memgraph password."),
             database: std::env::var("MEMGRAPH_DATABASE").unwrap_or_else(|_| default_memgraph_database().to_string()),
         };
         let connection = MemgraphConnection::connect(memgraph_config).await?;
@@ -1566,7 +1576,7 @@ async fn scan_directory(
         let mut path_is_registered = false;
         if let Ok((_, config)) = load_config() {
             let clean_target_lower = fs_utils::clean_path(&canonical_target).to_lowercase();
-            for (_, registered_path_str) in &config.projects {
+            for registered_path_str in config.projects.values() {
                 if let Ok(reg_path_buf) = PathBuf::from(registered_path_str).canonicalize() {
                     let clean_reg_path_lower = fs_utils::clean_path(&reg_path_buf).to_lowercase();
                     if clean_target_lower == clean_reg_path_lower 
@@ -2128,7 +2138,7 @@ fn canonicalize_target(target_path: &str) -> anyhow::Result<PathBuf> {
 async fn run_update() -> anyhow::Result<()> {
     // 1. Silently execute git fetch origin
     let fetch_status = std::process::Command::new("git")
-        .args(&["fetch", "origin"])
+        .args(["fetch", "origin"])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status();
@@ -2145,7 +2155,7 @@ async fn run_update() -> anyhow::Result<()> {
 
     // 2. Get current branch name
     let branch_output = match std::process::Command::new("git")
-        .args(&["rev-parse", "--abbrev-ref", "HEAD"])
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
         .output() {
             Ok(output) => output,
             Err(_) => {
@@ -2161,7 +2171,7 @@ async fn run_update() -> anyhow::Result<()> {
 
     // 3. Compare local and remote hashes
     let local_output = match std::process::Command::new("git")
-        .args(&["rev-parse", "HEAD"])
+        .args(["rev-parse", "HEAD"])
         .output() {
             Ok(output) => output,
             Err(_) => {
@@ -2177,7 +2187,7 @@ async fn run_update() -> anyhow::Result<()> {
 
     let remote_ref = format!("origin/{}", branch);
     let remote_output = match std::process::Command::new("git")
-        .args(&["rev-parse", &remote_ref])
+        .args(["rev-parse", &remote_ref])
         .output() {
             Ok(output) => output,
             Err(_) => {
@@ -2195,7 +2205,7 @@ async fn run_update() -> anyhow::Result<()> {
     // Check if HEAD is ancestor of remote (local is behind)
     let is_behind = if local_hash != remote_hash {
         let ancestor_status = std::process::Command::new("git")
-            .args(&["merge-base", "--is-ancestor", "HEAD", &remote_ref])
+            .args(["merge-base", "--is-ancestor", "HEAD", &remote_ref])
             .status();
         match ancestor_status {
             Ok(status) => status.success(),
@@ -2217,7 +2227,7 @@ async fn run_update() -> anyhow::Result<()> {
 
         println!("Reinstalling ozymem-cli globally...");
         let install_status = std::process::Command::new("cargo")
-            .args(&["install", "--path", "crates/ozymem-cli", "--force"])
+            .args(["install", "--path", "crates/ozymem-cli", "--force"])
             .status()?;
         if !install_status.success() {
             anyhow::bail!("Failed to execute 'cargo install'.");
@@ -2309,13 +2319,11 @@ async fn run_watch(context: &AppContext, target_path: &str, force: bool) -> anyh
                              use std::io::{BufRead, BufReader};
                              let reader = BufReader::new(file);
                              let mut entries = Vec::new();
-                             for line in reader.lines() {
-                                 if let Ok(line_str) = line {
-                                     if let Ok(entry) = serde_json::from_str::<ozymem_core::WalEntry>(&line_str) {
-                                         entries.push(entry);
-                                     }
-                                 }
-                             }
+                              for line_str in reader.lines().map_while(Result::ok) {
+                                      if let Ok(entry) = serde_json::from_str::<ozymem_core::WalEntry>(&line_str) {
+                                          entries.push(entry);
+                                      }
+                                  }
 
                              let mut success = true;
                              for entry in entries {
@@ -2384,11 +2392,10 @@ async fn run_watch(context: &AppContext, target_path: &str, force: bool) -> anyh
                             Ok(all_paths) => {
                                 for file_path_str in all_paths {
                                     let path_obj = Path::new(&file_path_str);
-                                    if is_ignored_by_patterns(path_obj, &ignore_patterns, &project_root) {
-                                        if let Err(_) = context.connection.delete_file_definition(&file_path_str).await {
+                                    if is_ignored_by_patterns(path_obj, &ignore_patterns, &project_root)
+                                        && context.connection.delete_file_definition(&file_path_str).await.is_err() {
                                             append_to_wal(&file_path_str, ozymem_core::WalAction::Delete);
                                             trigger_reconnect(context.connection.clone(), std::sync::Arc::clone(&is_connected), std::sync::Arc::clone(&reconnecting));
-                                        }
                                     }
                                 }
                             }
@@ -2520,7 +2527,7 @@ fn canonicalize_file(file_path: &str) -> anyhow::Result<PathBuf> {
 fn resolve_project_root(target_path: &Path) -> PathBuf {
     if let Ok((_, config)) = load_config() {
         let clean_target_lower = fs_utils::clean_path(target_path).to_lowercase();
-        for (_, registered_path_str) in &config.projects {
+        for registered_path_str in config.projects.values() {
             if let Ok(reg_path_buf) = PathBuf::from(registered_path_str).canonicalize() {
                 let clean_reg_path_lower = fs_utils::clean_path(&reg_path_buf).to_lowercase();
                 if clean_target_lower == clean_reg_path_lower 
@@ -2724,7 +2731,7 @@ fn check_directory_authorized(target_path: &str) -> anyhow::Result<()> {
     let (_, config) = load_config()?;
     
     let mut is_authorized = false;
-    for (_, registered_path_str) in &config.projects {
+    for registered_path_str in config.projects.values() {
         if let Ok(reg_path_buf) = PathBuf::from(registered_path_str).canonicalize() {
             let clean_reg_path_lower = fs_utils::clean_path(&reg_path_buf).to_lowercase();
             if clean_target_lower == clean_reg_path_lower {
@@ -2934,7 +2941,7 @@ fn run_stop(project_arg: Option<String>) -> anyhow::Result<()> {
                     if global_pid.exists() {
                         let pid_str = std::fs::read_to_string(&global_pid)?.trim().to_string();
                         let _ = std::process::Command::new("taskkill")
-                            .args(&["/PID", &pid_str, "/F"])
+                            .args(["/PID", &pid_str, "/F"])
                             .status()?;
                         let _ = std::fs::remove_file(&global_pid);
                         println!("[SUCCESS] Proceso del watcher global (PID: {}) detenido y limpiado.", pid_str);
@@ -2954,7 +2961,7 @@ fn run_stop(project_arg: Option<String>) -> anyhow::Result<()> {
 
     let pid_str = std::fs::read_to_string(&pid_file)?.trim().to_string();
     let _ = std::process::Command::new("taskkill")
-        .args(&["/PID", &pid_str, "/F"])
+        .args(["/PID", &pid_str, "/F"])
         .status()?;
 
     let _ = std::fs::remove_file(&pid_file);
@@ -3197,31 +3204,6 @@ fn get_project_identifier(target_path: &str) -> anyhow::Result<(String, String)>
     Ok((format!("unregistered-{}", folder_name), clean_target))
 }
 
-fn is_pid_alive(pid: u32) -> bool {
-    #[cfg(target_os = "windows")]
-    {
-        let output = std::process::Command::new("tasklist")
-            .args(&["/FI", &format!("PID eq {}", pid), "/NH"])
-            .output();
-        if let Ok(out) = output {
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            stdout.contains(&pid.to_string())
-        } else {
-            false
-        }
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        let status = std::process::Command::new("kill")
-            .args(&["-0", &pid.to_string()])
-            .status();
-        match status {
-            Ok(s) => s.success(),
-            Err(_) => false,
-        }
-    }
-}
-
 fn get_last_log_line(log_path: &Path) -> String {
     if !log_path.exists() {
         return "Watcher no inicializado.".to_string();
@@ -3275,7 +3257,7 @@ async fn run_mcp_setup() -> anyhow::Result<()> {
     let token = std::env::var("OZYBASE_MCP_TOKEN")
         .ok()
         .or_else(|| load_config().ok().and_then(|(_, cfg)| cfg.token))
-        .unwrap_or_else(|| String::new());
+        .unwrap_or_default();
 
     let ozymem_cmd = resolve_ozymem_binary(&home::home_dir().context("No se pudo determinar el directorio home.")?);
     let mcp_value = serde_json::json!({
@@ -3296,7 +3278,7 @@ fn kill_pid(pid: u32) -> anyhow::Result<()> {
     #[cfg(target_os = "windows")]
     {
         let _ = std::process::Command::new("taskkill")
-            .args(&["/PID", &pid.to_string(), "/F"])
+            .args(["/PID", &pid.to_string(), "/F"])
             .status()?;
     }
     #[cfg(not(target_os = "windows"))]
@@ -3417,7 +3399,7 @@ async fn run_init() -> anyhow::Result<()> {
         
         // Intentar docker start
         let start_status = std::process::Command::new("docker")
-            .args(&["start", "ozymem-memgraph", "ozymem-memgraph-lab"])
+            .args(["start", "ozymem-memgraph", "ozymem-memgraph-lab"])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status();
@@ -3431,7 +3413,7 @@ async fn run_init() -> anyhow::Result<()> {
             // Intentar docker compose up -d en la ruta de ozymem
             if let Some(ozymem_path) = config.projects.get("ozymem") {
                 let compose_status = std::process::Command::new("docker")
-                    .args(&["compose", "up", "-d"])
+                    .args(["compose", "up", "-d"])
                     .current_dir(ozymem_path)
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null())
@@ -3546,7 +3528,7 @@ async fn run_doctor(json_output: bool) -> anyhow::Result<()> {
     let mut lab_container_running = false;
     if docker_running {
         if let Ok(out) = std::process::Command::new("docker")
-            .args(&["ps", "--filter", "name=ozymem-memgraph", "--format", "{{.Names}}:{{.Status}}"])
+            .args(["ps", "--filter", "name=ozymem-memgraph", "--format", "{{.Names}}:{{.Status}}"])
             .output()
         {
             let stdout = String::from_utf8_lossy(&out.stdout);
@@ -3655,8 +3637,8 @@ async fn run_doctor(json_output: bool) -> anyhow::Result<()> {
     println!();
     println!("Variables de Entorno:");
     println!("  - MEMGRAPH_URI:      {}", env_uri.unwrap_or_else(|_| format!("{} (Por defecto)", default_memgraph_uri())));
-    println!("  - MEMGRAPH_USER:     {}", env_user.unwrap_or_else(|_| format!("{} (Por defecto)", "admin")));
-    println!("  - MEMGRAPH_PASSWORD: {}", if env_password.is_ok() { "[ESTABLECIDA]" } else { "[POR DEFECTO]" });
+    println!("  - MEMGRAPH_USER:     {}", env_user.unwrap_or_else(|_| "[NO ESTABLECIDA - REQUERIDA]".to_string()));
+    println!("  - MEMGRAPH_PASSWORD: {}", if env_password.is_ok() { "[ESTABLECIDA]" } else { "[NO ESTABLECIDA - REQUERIDA]" });
     println!("  - MEMGRAPH_DATABASE: {}", env_database.unwrap_or_else(|_| format!("{} (Por defecto)", default_memgraph_database())));
     println!();
 
@@ -3702,7 +3684,7 @@ async fn run_auth_reset_token() -> anyhow::Result<()> {
     }
 
     let (config_path, mut config) = load_config()?;
-    let current_token = config.token.clone().unwrap_or_else(|| String::new());
+    let current_token = config.token.clone().unwrap_or_default();
     
     let server_uuid = if current_token.starts_with("ozy_partner_ctx_") && current_token.contains("_usr_") {
         let trimmed = &current_token["ozy_partner_ctx_".len()..];

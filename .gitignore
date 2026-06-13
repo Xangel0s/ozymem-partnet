@@ -1,6 +1,37 @@
+# Build artifacts
 /target
 **/target
-Cargo.lock
-.idea
-.vscode/.ropeproject
+
+# IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS files
 .DS_Store
+Thumbs.db
+
+# Environment files (NEVER commit these!)
+.env
+.env.*
+!.env.example
+
+# Security files
+*.pem
+*.key
+*.cert
+*.p12
+
+# Ozymem config (contains tokens)
+.ozymem.toml
+
+# Ozymem WAL and logs
+.ozymem_wal
+.ozymem-*.log
+.ozymem-*.pid
+.ozymem-init-*.log
+
+# Docker
+docker-compose.override.yml

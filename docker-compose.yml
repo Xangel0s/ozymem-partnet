@@ -1,19 +1,33 @@
+# Development Docker Compose
+# For production, use docker-compose.prod.yml
+# Make sure to set MEMGRAPH_USER and MEMGRAPH_PASSWORD in .env file
+
 services:
   memgraph:
     image: memgraph/memgraph:latest
     container_name: ozymem-memgraph
     ports:
-      - "7687:7687"
+      - "127.0.0.1:7687:7687"
     volumes:
       - memgraph-data:/var/lib/memgraph
+    environment:
+      - MEMGRAPH_USER=${MEMGRAPH_USER:-admin}
+      - MEMGRAPH_PASSWORD=${MEMGRAPH_PASSWORD:-admin}
+    healthcheck:
+      test: ["CMD", "mg_console", "--help"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
 
   memgraph-lab:
     image: memgraph/lab:latest
     container_name: ozymem-memgraph-lab
     depends_on:
-      - memgraph
+      memgraph:
+        condition: service_healthy
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
     environment:
       QUICK_CONNECT_MG_HOST: memgraph
       QUICK_CONNECT_MG_PORT: 7687

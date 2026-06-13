@@ -550,10 +550,8 @@ fn find_brace_block_end(lines: &[&str], start_index: usize) -> usize {
             if character == '{' {
                 depth += 1;
                 seen_open = true;
-            } else if character == '}' {
-                if depth > 0 {
-                    depth -= 1;
-                }
+            } else if character == '}' && depth > 0 {
+                depth = depth.saturating_sub(1);
             }
             i += 1;
         }

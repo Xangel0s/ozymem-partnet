@@ -153,15 +153,13 @@ impl MemgraphConnection {
         if let Some(row) = result.next().await? {
             let stored_token: String = row.get("stored_token")?;
             let parts: Vec<&str> = stored_token.splitn(2, ':').collect();
+            // Only accept salted tokens (format: salt:hash)
             let is_valid = if parts.len() == 2 {
                 let expected_hash = Self::hash_token_with_salt(parts[0], user_token);
                 expected_hash == parts[1]
             } else {
-                // Legacy unsalted hash fallback
-                use sha2::{Sha256, Digest};
-                let mut hasher = Sha256::new();
-                hasher.update(user_token.as_bytes());
-                hex::encode(hasher.finalize()) == stored_token
+                // Legacy unsalted tokens are rejected for security
+                false
             };
             if is_valid {
                 Ok(Some(UserRecord {
@@ -808,6 +806,7 @@ impl MemgraphConnection {
         Ok(gpr_id)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_lesson_gpr(
         &self,
         tenant_id: &str,
@@ -1062,12 +1061,12 @@ pub struct SessionRecord {
     pub last_seen: String,
 }
 
-fn is_pid_alive(pid: i64) -> bool {
+pub fn is_pid_alive(pid: u32) -> bool {
     #[cfg(target_os = "windows")]
     {
         use std::process::Command;
         if let Ok(output) = Command::new("tasklist")
-            .args(&["/FI", &format!("PID eq {}", pid), "/NH"])
+            .args(["/FI", &format!("PID eq {}", pid), "/NH"])
             .output()
         {
             let stdout = String::from_utf8_lossy(&output.stdout);
@@ -1173,7 +1172,7 @@ impl MemgraphConnection {
                 continue;
             }
 
-            if !is_pid_alive(pid) {
+            if !is_pid_alive(pid as u32) {
                 to_delete.push(id);
             }
         }

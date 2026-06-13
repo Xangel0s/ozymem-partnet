@@ -21,9 +21,41 @@ use std::time::{Duration, Instant};
 use std::sync::Mutex;
 use tokio::sync::OnceCell;
 use tokio::io::{self, AsyncBufReadExt, BufReader};
+use tracing::{info, warn, error};
+
+fn validate_environment() -> anyhow::Result<()> {
+    let required_vars = ["MEMGRAPH_USER", "MEMGRAPH_PASSWORD"];
+    let mut missing = Vec::new();
+
+    for var in &required_vars {
+        if std::env::var(var).is_err() {
+            missing.push(*var);
+        }
+    }
+
+    if !missing.is_empty() {
+        anyhow::bail!(
+            "Security error: Missing required environment variables: {}. \
+             These are required for production security. Do not use default credentials.",
+            missing.join(", ")
+        );
+    }
+
+    Ok(())
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Initialize tracing with env-filter (default: info level)
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
+
+    validate_environment()?;
+
     let is_web = std::env::args().any(|arg| arg == "--web")
         || std::env::var("OZYMEM_SERVER_MODE").as_deref() == Ok("web");
 
@@ -55,7 +87,7 @@ async fn run_server(connection_cell: Arc<OnceCell<MemgraphConnection>>) -> anyho
                 mcp_common::write_response(&mut stdout, &response).await?;
             }
         } else {
-            eprintln!("[WARNING] Recibida línea no válida para JSON-RPC: {}", trimmed);
+            warn!("Invalid JSON-RPC line received: {}", trimmed);
         }
     }
 
@@ -64,10 +96,14 @@ async fn run_server(connection_cell: Arc<OnceCell<MemgraphConnection>>) -> anyho
 
 async fn get_connection(cell: &OnceCell<MemgraphConnection>) -> anyhow::Result<&MemgraphConnection> {
     cell.get_or_try_init(|| async {
+        let user = std::env::var("MEMGRAPH_USER")
+            .expect("MEMGRAPH_USER environment variable is required for security. Set it to your Memgraph username.");
+        let password = std::env::var("MEMGRAPH_PASSWORD")
+            .expect("MEMGRAPH_PASSWORD environment variable is required for security. Set it to your Memgraph password.");
         let config = MemgraphConfig {
             uri: std::env::var("MEMGRAPH_URI").unwrap_or_else(|_| default_memgraph_uri().to_string()),
-            user: std::env::var("MEMGRAPH_USER").unwrap_or_else(|_| "admin".to_string()),
-            password: std::env::var("MEMGRAPH_PASSWORD").unwrap_or_else(|_| "admin".to_string()),
+            user,
+            password,
             database: std::env::var("MEMGRAPH_DATABASE")
                 .unwrap_or_else(|_| default_memgraph_database().to_string()),
         };
@@ -87,20 +123,20 @@ async fn get_connection(cell: &OnceCell<MemgraphConnection>) -> anyhow::Result<&
                 let master_credential = format!("ozy_partner_ctx_{}_usr_{}", master_tenant_id, master_token_hex);
                 
                 if let Err(e) = conn.create_tenant("Default Tenant", master_tenant_id).await {
-                    eprintln!("[ERROR] Setup Génesis failed to create tenant: {:?}", e);
+                    error!("Genesis setup failed to create tenant: {:?}", e);
                 } else if let Err(e) = conn.create_user(master_tenant_id, master_user, "Lead", &master_token_hex).await {
-                    eprintln!("[ERROR] Setup Génesis failed to create user: {:?}", e);
+                    error!("Genesis setup failed to create user: {:?}", e);
                 } else {
-                    eprintln!("\n================ 🚀 OZYMEM-PARTNER SETUP ================");
-                    eprintln!("¡Base de datos limpia detectada! Creando primer Lead Developer...");
-                    eprintln!("\n🔑 CREDENCIAL MAESTRA GENERADA: {}", master_credential);
-                    eprintln!("📌 Guarda esta credencial de inmediato. La necesitarás para tu CLI local.");
-                    eprintln!("=========================================================\n");
+                    info!("Genesis setup complete - empty database detected, created first Lead Developer");
+                    eprintln!("\n================ OZYMEM-PARTNER SETUP ================");
+                    eprintln!("CREDENCIAL MAESTRA GENERADA: {}", master_credential);
+                    eprintln!("Guarda esta credencial de inmediato. La necesitarás para tu CLI local.");
+                    eprintln!("=====================================================\n");
                 }
             }
             Ok(true) => {}
             Err(e) => {
-                eprintln!("[WARNING] Failed to query user database state: {:?}", e);
+                warn!("Failed to query user database state: {:?}", e);
             }
         }
         
@@ -308,7 +344,7 @@ struct GprDiffQuery {
     gpr_id: i64,
 }
 
-/// Simple in-memory rate limiter: 100 requests per 60 seconds window.
+/// Simple in-memory rate limiter: 100 requests per 60 seconds window per IP.
 struct RateLimiter {
     window: Vec<Instant>,
     max_requests: usize,
@@ -332,15 +368,65 @@ impl RateLimiter {
     }
 }
 
-static RATE_LIMITER: std::sync::LazyLock<Mutex<RateLimiter>> = std::sync::LazyLock::new(|| {
-    Mutex::new(RateLimiter::new(100, Duration::from_secs(60)))
+struct IpRateLimiter {
+    limiters: std::collections::HashMap<String, RateLimiter>,
+    max_requests: usize,
+    window_duration: Duration,
+}
+
+impl IpRateLimiter {
+    fn new(max_requests: usize, window_duration: Duration) -> Self {
+        Self {
+            limiters: std::collections::HashMap::new(),
+            max_requests,
+            window_duration,
+        }
+    }
+
+    fn check(&mut self, ip: &str) -> bool {
+        let limiter = self.limiters
+            .entry(ip.to_string())
+            .or_insert_with(|| RateLimiter::new(self.max_requests, self.window_duration));
+        limiter.check()
+    }
+}
+
+static RATE_LIMITER: std::sync::LazyLock<Mutex<IpRateLimiter>> = std::sync::LazyLock::new(|| {
+    Mutex::new(IpRateLimiter::new(100, Duration::from_secs(60)))
 });
+
+fn extract_client_ip(request: &axum::http::Request<axum::body::Body>) -> String {
+    // Check X-Forwarded-For first (for reverse proxies like Coolify/Nginx)
+    if let Some(forwarded) = request.headers().get("X-Forwarded-For") {
+        if let Ok(value) = forwarded.to_str() {
+            if let Some(first_ip) = value.split(',').next() {
+                return first_ip.trim().to_string();
+            }
+        }
+    }
+    
+    // Check X-Real-IP
+    if let Some(real_ip) = request.headers().get("X-Real-IP") {
+        if let Ok(value) = real_ip.to_str() {
+            return value.trim().to_string();
+        }
+    }
+    
+    // Fallback to socket address
+    request
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|addr| addr.0.ip().to_string())
+        .unwrap_or_else(|| "unknown".to_string())
+}
 
 async fn rate_limit_middleware(
     request: axum::http::Request<axum::body::Body>,
     next: middleware::Next,
 ) -> Result<axum::response::Response, axum::response::Response> {
-    if RATE_LIMITER.lock().unwrap_or_else(|e| e.into_inner()).check() {
+    let client_ip = extract_client_ip(&request);
+    
+    if RATE_LIMITER.lock().unwrap_or_else(|e| e.into_inner()).check(&client_ip) {
         Ok(next.run(request).await)
     } else {
         Err(axum::response::Response::builder()
@@ -393,8 +479,11 @@ async fn run_web_server(connection_cell: Arc<OnceCell<MemgraphConnection>>) -> a
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(8080);
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
-    eprintln!("[INFO] Iniciando servidor web de Ozymem-Partner en {}", addr);
+    info!("Starting Ozymem-Partner web server on {}", addr);
 
+    // Max 10MB request body to prevent memory exhaustion attacks
+    let body_limit = tower_http::limit::RequestBodyLimitLayer::new(10 * 1024 * 1024);
+    
     let app = Router::new()
         .route("/api/health", get(handle_health))
         .route("/api/clear", post(handle_clear))
@@ -418,12 +507,23 @@ async fn run_web_server(connection_cell: Arc<OnceCell<MemgraphConnection>>) -> a
         .route("/api/gpr/list", get(handle_gpr_list))
         .route("/api/gpr/diff", get(handle_gpr_diff))
         .route("/api/gpr/merge", post(handle_gpr_merge))
+        .layer(body_limit)
         .layer(middleware::from_fn_with_state(connection_cell.clone(), auth_middleware))
         .layer(middleware::from_fn(rate_limit_middleware))
         .with_state(connection_cell);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    
+    // Graceful shutdown: handle SIGTERM and SIGINT
+    let shutdown_signal = async {
+        let ctrl_c = tokio::signal::ctrl_c();
+        ctrl_c.await.ok();
+        info!("Received shutdown signal, shutting down gracefully...");
+    };
+    
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal)
+        .await?;
     Ok(())
 }
 

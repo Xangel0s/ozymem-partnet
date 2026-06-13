@@ -25,8 +25,8 @@ pub fn is_browser_cache_path(path_str_lower: &str) -> bool {
 
 pub fn clean_path(path: &Path) -> String {
     let s = path.to_string_lossy().to_string();
-    if s.starts_with(r"\\?\") {
-        s[4..].to_string()
+    if let Some(stripped) = s.strip_prefix(r"\\?\") {
+        stripped.to_string()
     } else {
         s
     }

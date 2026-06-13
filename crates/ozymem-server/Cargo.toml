@@ -7,6 +7,8 @@ publish.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
 ozymem-core = { path = "../ozymem-core" }
 ozymem-parser = { path = "../ozymem-parser" }
 neo4rs = { workspace = true }
@@ -15,5 +17,5 @@ serde_json = "1"
 tokio.workspace = true
 rand = "0.8"
 axum = "0.7"
-tower-http = { version = "0.5", features = ["cors"] }
+tower-http = { version = "0.5", features = ["cors", "limit"] }
 async-trait.workspace = true

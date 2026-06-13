@@ -9,6 +9,7 @@ resolver = "2"
 
 [workspace.package]
 edition = "2021"
+rust-version = "1.75.0"
 version = "0.1.0"
 license = "MIT"
 publish = false
@@ -27,3 +28,5 @@ tree-sitter-javascript = "0.25"
 tree-sitter-rust = "0.24.2"
 walkdir = "2"
 async-trait = "0.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }

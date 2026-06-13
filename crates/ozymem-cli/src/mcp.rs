@@ -29,8 +29,8 @@ static SESSION: LazyLock<Mutex<McpSession>> = LazyLock::new(|| Mutex::new(McpSes
 }));
 
 fn clean_path_str(path_str: &str) -> String {
-    if path_str.starts_with(r"\\?\") {
-        path_str[4..].to_string()
+    if let Some(stripped) = path_str.strip_prefix(r"\\?\") {
+        stripped.to_string()
     } else {
         path_str.to_string()
     }
@@ -122,6 +122,7 @@ async fn get_connection(
         .await
 }
 
+#[allow(clippy::await_holding_lock)]
 async fn handle_request(
     connection_cell: &OnceCell<crate::BackendClient>,
     request: JsonRpcRequest,

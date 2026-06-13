@@ -7,6 +7,7 @@ publish.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+tracing.workspace = true
 neo4rs.workspace = true
 ozymem-parser = { path = "../ozymem-parser" }
 serde.workspace = true
