@@ -1,6 +1,10 @@
 use ozymem_core::{
-    default_memgraph_database, default_memgraph_uri, FileGraphContext, GraphSummary,
+    default_memgraph_database, default_memgraph_uri, mcp_common, FileGraphContext, GraphSummary,
     MemgraphConfig, MemgraphConnection, UserRecord,
+};
+use ozymem_core::mcp_common::{
+    InitializeResult, JsonRpcRequest, JsonRpcResponse, McpBackend, ServerCapabilities,
+    ServerInfo, ToolCallParams, ToolListResult, ToolsCapability,
 };
 use axum::{
     extract::{Query, State},
@@ -10,87 +14,13 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use serde::{Deserialize, Serialize};
-use serde_json::{json, Map, Value};
+use serde::Deserialize;
+use serde_json::{json, Value};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
+use std::sync::Mutex;
 use tokio::sync::OnceCell;
-use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
-
-#[derive(Debug, Deserialize)]
-struct JsonRpcRequest {
-    jsonrpc: String,
-    id: Option<Value>,
-    method: String,
-    #[serde(default)]
-    params: Option<Value>,
-}
-
-#[derive(Debug, Serialize)]
-struct JsonRpcResponse {
-    jsonrpc: &'static str,
-    id: Value,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    result: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<JsonRpcError>,
-}
-
-#[derive(Debug, Serialize)]
-struct JsonRpcError {
-    code: i64,
-    message: String,
-}
-
-#[derive(Debug, Serialize)]
-struct InitializeResult {
-    protocol_version: &'static str,
-    capabilities: ServerCapabilities,
-    server_info: ServerInfo,
-}
-
-#[derive(Debug, Serialize)]
-struct ServerCapabilities {
-    tools: ToolsCapability,
-}
-
-#[derive(Debug, Serialize)]
-struct ToolsCapability {
-    #[serde(rename = "listChanged", skip_serializing_if = "Option::is_none")]
-    list_changed: Option<bool>,
-}
-
-#[derive(Debug, Serialize)]
-struct ServerInfo {
-    name: &'static str,
-    version: &'static str,
-}
-
-#[derive(Debug, Serialize)]
-struct ToolListResult {
-    tools: Vec<ToolDefinition>,
-}
-
-#[derive(Debug, Serialize)]
-struct ToolDefinition {
-    name: &'static str,
-    description: &'static str,
-    #[serde(rename = "inputSchema")]
-    input_schema: Value,
-}
-
-#[derive(Debug, Serialize)]
-struct ToolCallResult {
-    content: Vec<ContentBlock>,
-    #[serde(rename = "isError", skip_serializing_if = "Option::is_none")]
-    is_error: Option<bool>,
-}
-
-#[derive(Debug, Serialize)]
-struct ContentBlock {
-    #[serde(rename = "type")]
-    kind: &'static str,
-    text: String,
-}
+use tokio::io::{self, AsyncBufReadExt, BufReader};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -122,7 +52,7 @@ async fn run_server(connection_cell: Arc<OnceCell<MemgraphConnection>>) -> anyho
 
         if let Ok(request) = serde_json::from_str::<JsonRpcRequest>(trimmed) {
             if let Some(response) = handle_request(&connection_cell, request).await? {
-                write_response(&mut stdout, &response).await?;
+                mcp_common::write_response(&mut stdout, &response).await?;
             }
         } else {
             eprintln!("[WARNING] Recibida línea no válida para JSON-RPC: {}", trimmed);
@@ -178,12 +108,49 @@ async fn get_connection(cell: &OnceCell<MemgraphConnection>) -> anyhow::Result<&
     }).await
 }
 
+/// Wrapper that implements McpBackend with "local" tenant for the server's MCP stdio mode.
+struct McpMemgraphBackend(MemgraphConnection);
+
+#[async_trait::async_trait]
+impl McpBackend for McpMemgraphBackend {
+    fn tenant_id(&self) -> String {
+        "local".to_string()
+    }
+
+    async fn get_graph_summary(&self) -> anyhow::Result<GraphSummary> {
+        self.0.get_graph_summary("local").await
+    }
+
+    async fn get_file_context(&self, file_path: &str) -> anyhow::Result<Option<FileGraphContext>> {
+        self.0.get_file_context("local", file_path).await
+    }
+
+    async fn get_historical_engram_solutions(&self, file_path: &str) -> anyhow::Result<Vec<String>> {
+        self.0.get_historical_engram_solutions("local", file_path).await
+    }
+
+    async fn record_lesson(&self, file_path: &str, symbol_name: Option<&str>, error_context: &str, solution: &str) -> anyhow::Result<()> {
+        self.0.record_lesson("local", file_path, symbol_name, error_context, solution).await
+    }
+
+    async fn get_incoming_dependencies(&self, file_path: &str) -> anyhow::Result<Vec<String>> {
+        self.0.get_incoming_dependencies("local", file_path).await
+    }
+
+    async fn find_symbol(&self, _symbol_name: &str, _project_path: &str) -> anyhow::Result<Vec<String>> {
+        Err(anyhow::anyhow!("find_symbol is not available in server MCP mode"))
+    }
+}
+
+/// Tools that the server MCP stdio mode exposes (subset of all MCP tools).
+const SERVER_MCP_TOOLS: &[&str] = &["file_context", "graph_summary", "record_lesson", "file_trace"];
+
 async fn handle_request(
     connection_cell: &OnceCell<MemgraphConnection>,
     request: JsonRpcRequest,
 ) -> anyhow::Result<Option<JsonRpcResponse>> {
     if request.jsonrpc != "2.0" {
-        return Ok(Some(error_response(
+        return Ok(Some(mcp_common::error_response(
             request.id.unwrap_or(Value::Null),
             -32600,
             "Invalid JSON-RPC version",
@@ -209,82 +176,17 @@ async fn handle_request(
                 },
             };
 
-            ok_response(id, serde_json::to_value(payload)?)
+            mcp_common::ok_response(id, serde_json::to_value(payload)?)
         }
         "notifications/initialized" => return Ok(None),
         "tools/list" => {
             let payload = ToolListResult {
-                tools: vec![
-                    ToolDefinition {
-                        name: "file_context",
-                        description: "Return the indexed file context, including language, strategy, and functions.",
-                        input_schema: json!({
-                            "type": "object",
-                            "properties": {
-                                "file_path": {
-                                    "type": "string",
-                                    "description": "Path used when the file was indexed"
-                                }
-                            },
-                            "required": ["file_path"],
-                            "additionalProperties": false
-                        }),
-                    },
-                    ToolDefinition {
-                        name: "graph_summary",
-                        description: "Summarize the indexed graph with file and function counts.",
-                        input_schema: json!({
-                            "type": "object",
-                            "properties": {},
-                            "additionalProperties": false
-                        }),
-                    },
-                    ToolDefinition {
-                        name: "record_lesson",
-                        description: "Record an error-to-fix lesson for a file or symbol as historical memory.",
-                        input_schema: json!({
-                            "type": "object",
-                            "properties": {
-                                "file_path": {
-                                    "type": "string",
-                                    "description": "Absolute path of the file that failed"
-                                },
-                                "symbol_name": {
-                                    "type": "string",
-                                    "description": "Optional name of the class or function where the error occurred"
-                                },
-                                "error_context": {
-                                    "type": "string",
-                                    "description": "Details about the error context or compilation message"
-                                },
-                                "solution": {
-                                    "type": "string",
-                                    "description": "Short fix or lesson learned"
-                                }
-                            },
-                            "required": ["file_path", "error_context", "solution"],
-                            "additionalProperties": false
-                        }),
-                    },
-                    ToolDefinition {
-                        name: "file_trace",
-                        description: "Trace incoming/reverse dependencies of an indexed file (impact analysis / who depends on this file).",
-                        input_schema: json!({
-                            "type": "object",
-                            "properties": {
-                                "file_path": {
-                                    "type": "string",
-                                    "description": "Path of the file to trace reverse dependencies for"
-                                }
-                            },
-                            "required": ["file_path"],
-                            "additionalProperties": false
-                        }),
-                    },
-                ],
+                tools: mcp_common::get_tools_list()
+                    .into_iter()
+                    .filter(|t| SERVER_MCP_TOOLS.contains(&t.name))
+                    .collect(),
             };
-
-            ok_response(id, serde_json::to_value(payload)?)
+            mcp_common::ok_response(id, serde_json::to_value(payload)?)
         }
         "tools/call" => {
             let params = request
@@ -292,230 +194,47 @@ async fn handle_request(
                 .ok_or_else(|| anyhow::anyhow!("missing params for tools/call"))?;
             let tool_call: ToolCallParams = serde_json::from_value(params)?;
 
-            // Establish connection lazily
+            if !SERVER_MCP_TOOLS.contains(&tool_call.name.as_str()) {
+                return Ok(Some(mcp_common::error_response(id, -32601, "Unknown tool")));
+            }
+
             let connection = match get_connection(connection_cell).await {
                 Ok(conn) => conn,
                 Err(e) => {
-                    return Ok(Some(error_response(id, -32603, &format!("Memgraph connection failed: {:?}", e))));
+                    return Ok(Some(mcp_common::error_response(id, -32603, &format!("Memgraph connection failed: {:?}", e))));
                 }
             };
 
-            let payload = match tool_call.name.as_str() {
-                "file_context" => {
-                    let file_path = read_string_argument(&tool_call.arguments, "file_path")
-                        .or_else(|_| read_string_argument(&tool_call.arguments, "path"))?;
-                    let context = connection.get_file_context("local", &file_path).await?;
-                    let historical_engrams = connection
-                        .get_historical_engram_solutions("local", &file_path)
-                        .await?;
-                    let body = format_file_context(context.as_ref(), &file_path);
-                    ToolCallResult {
-                        content: vec![ContentBlock {
-                            kind: "text",
-                            text: prepend_historical_engrams(&historical_engrams, body),
-                        }],
-                        is_error: None,
-                    }
-                }
-                "graph_summary" => {
-                    let summary = connection.get_graph_summary("local").await?;
-                    ToolCallResult {
-                        content: vec![ContentBlock {
-                            kind: "text",
-                            text: format_graph_summary(&summary),
-                        }],
-                        is_error: None,
-                    }
-                }
-                "record_lesson" => {
-                    let file_path = read_string_argument(&tool_call.arguments, "file_path")?;
-                    let symbol_name = tool_call.arguments.get("symbol_name")
-                        .and_then(Value::as_str);
-                    let error_context = read_string_argument(&tool_call.arguments, "error_context")?;
-                    let solution = read_string_argument(&tool_call.arguments, "solution")?;
+            let backend = McpMemgraphBackend(connection.clone());
 
-                    connection
-                        .record_lesson("local", &file_path, symbol_name, &error_context, &solution)
-                        .await?;
-
-                    ToolCallResult {
-                        content: vec![ContentBlock {
-                            kind: "text",
-                            text: format!(
-                                "Recorded lesson for {file_path}{}",
-                                symbol_name.map(|s| format!("::{}", s)).unwrap_or_default()
-                            ),
-                        }],
-                        is_error: None,
-                    }
-                }
-                "file_trace" => {
-                    let file_path = read_string_argument(&tool_call.arguments, "file_path")
-                        .or_else(|_| read_string_argument(&tool_call.arguments, "path"))?;
-                    let incoming = connection.get_incoming_dependencies("local", &file_path).await?;
-                    let mut text = format!("Reverse dependencies (files impacted by changes to {}):\n", file_path);
-                    if incoming.is_empty() {
-                        text.push_str("- (none)");
-                    } else {
-                        for path in incoming {
-                            text.push_str(&format!("- {path}\n"));
-                        }
-                    }
-                    ToolCallResult {
-                        content: vec![ContentBlock {
-                            kind: "text",
-                            text,
-                        }],
-                        is_error: None,
-                    }
-                }
-                _ => {
-                    return Ok(Some(error_response(id, -32601, "Unknown tool")));
+            let payload = match mcp_common::handle_mcp_tool_call(
+                &backend,
+                &tool_call.name,
+                &tool_call.arguments,
+                None,
+                None,
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(e) => {
+                    return Ok(Some(mcp_common::error_response(
+                        id,
+                        -32603,
+                        &format!("Tool call error: {:?}", e),
+                    )));
                 }
             };
 
-            ok_response(id, serde_json::to_value(payload)?)
+            mcp_common::ok_response(id, serde_json::to_value(payload)?)
         }
-        _ => error_response(id, -32601, "Method not found"),
+        _ => mcp_common::error_response(id, -32601, "Method not found"),
     };
 
     Ok(Some(response))
 }
 
-#[derive(Debug, Deserialize)]
-struct ToolCallParams {
-    name: String,
-    #[serde(default)]
-    arguments: Map<String, Value>,
-}
 
-fn read_string_argument(arguments: &Map<String, Value>, key: &str) -> anyhow::Result<String> {
-    arguments
-        .get(key)
-        .and_then(Value::as_str)
-        .map(|value| value.to_string())
-        .ok_or_else(|| anyhow::anyhow!("missing required string argument: {key}"))
-}
-
-async fn write_response(writer: &mut io::Stdout, response: &JsonRpcResponse) -> anyhow::Result<()> {
-    let payload = serde_json::to_string(response)?;
-    writer.write_all(format!("{}\n", payload).as_bytes()).await?;
-    writer.flush().await?;
-    Ok(())
-}
-
-fn ok_response(id: Value, result: Value) -> JsonRpcResponse {
-    JsonRpcResponse {
-        jsonrpc: "2.0",
-        id,
-        result: Some(result),
-        error: None,
-    }
-}
-
-fn error_response(id: Value, code: i64, message: &str) -> JsonRpcResponse {
-    JsonRpcResponse {
-        jsonrpc: "2.0",
-        id,
-        result: None,
-        error: Some(JsonRpcError {
-            code,
-            message: message.to_string(),
-        }),
-    }
-}
-
-fn format_file_context(context: Option<&FileGraphContext>, file_path: &str) -> String {
-    let Some(context) = context else {
-        return format!("No indexed file found for {file_path}");
-    };
-
-    let mut output = format!(
-        "File: {}\nLanguage: {}\nFunctions: {}",
-        context.file_path,
-        context.language,
-        context.functions.len()
-    );
-
-    for function in &context.functions {
-        output.push_str(&format!(
-            "\n- {} [{}] lines {}-{} via {}",
-            function.name, function.kind, function.start_line, function.end_line, function.strategy
-        ));
-    }
-
-    output
-}
-
-fn prepend_historical_engrams(history: &[String], body: String) -> String {
-    if history.is_empty() {
-        return body;
-    }
-
-    let mut output = String::from("[HISTORICAL ENGRAMS FOR THIS FILE:\n");
-    for solution in history {
-        output.push_str(&format!("- {solution}\n"));
-    }
-    output.push_str("]\n\n");
-    output.push_str(&body);
-    output
-}
-
-fn format_graph_summary(summary: &GraphSummary) -> String {
-    format!(
-        "Files: {}\nFunctions: {}\nEngrams: {}\nNative AST functions: {}\nExtension WASM functions: {}\nText heuristic functions: {}",
-        summary.file_count,
-        summary.function_count,
-        summary.engram_count,
-        summary.native_ast_function_count,
-        summary.extension_wasm_function_count,
-        summary.text_heuristic_function_count
-    )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn formats_missing_context() {
-        let text = format_file_context(None, "src/lib.rs");
-        assert!(text.contains("No indexed file found"));
-    }
-
-    #[test]
-    fn formats_summary() {
-        let summary = GraphSummary {
-            file_count: 2,
-            function_count: 5,
-            engram_count: 1,
-            native_ast_function_count: 3,
-            extension_wasm_function_count: 1,
-            text_heuristic_function_count: 1,
-            vertex_count: 0,
-            edge_count: 0,
-            memory_usage: "".to_string(),
-        };
-
-        let text = format_graph_summary(&summary);
-        assert!(text.contains("Files: 2"));
-        assert!(text.contains("Functions: 5"));
-    }
-
-    #[test]
-    fn prepends_historical_engrams_only_when_present() {
-        let body = "File: a\nLanguage: Rust\nFunctions: 1".to_string();
-        let with_history =
-            prepend_historical_engrams(&["fix a".to_string(), "fix b".to_string()], body.clone());
-        assert!(with_history.starts_with("[HISTORICAL ENGRAMS FOR THIS FILE:"));
-        assert!(with_history.contains("- fix a"));
-        assert!(with_history.contains("- fix b"));
-        assert!(with_history.ends_with(&body));
-
-        let without_history = prepend_historical_engrams(&[], body.clone());
-        assert_eq!(without_history, body);
-    }
-}
 
 // ==========================================
 // AXUM HTTP API WEB SERVER (COLLABORATIVE)
@@ -589,6 +308,49 @@ struct GprDiffQuery {
     gpr_id: i64,
 }
 
+/// Simple in-memory rate limiter: 100 requests per 60 seconds window.
+struct RateLimiter {
+    window: Vec<Instant>,
+    max_requests: usize,
+    window_duration: Duration,
+}
+
+impl RateLimiter {
+    fn new(max_requests: usize, window_duration: Duration) -> Self {
+        Self { window: Vec::new(), max_requests, window_duration }
+    }
+
+    fn check(&mut self) -> bool {
+        let now = Instant::now();
+        self.window.retain(|t| now.duration_since(*t) < self.window_duration);
+        if self.window.len() >= self.max_requests {
+            false
+        } else {
+            self.window.push(now);
+            true
+        }
+    }
+}
+
+static RATE_LIMITER: std::sync::LazyLock<Mutex<RateLimiter>> = std::sync::LazyLock::new(|| {
+    Mutex::new(RateLimiter::new(100, Duration::from_secs(60)))
+});
+
+async fn rate_limit_middleware(
+    request: axum::http::Request<axum::body::Body>,
+    next: middleware::Next,
+) -> Result<axum::response::Response, axum::response::Response> {
+    if RATE_LIMITER.lock().unwrap_or_else(|e| e.into_inner()).check() {
+        Ok(next.run(request).await)
+    } else {
+        Err(axum::response::Response::builder()
+            .status(429)
+            .header("Retry-After", "60")
+            .body(axum::body::Body::from("Rate limit exceeded. Try again in 60 seconds."))
+            .unwrap())
+    }
+}
+
 async fn auth_middleware(
     State(conn_cell): State<Arc<OnceCell<MemgraphConnection>>>,
     headers: HeaderMap,
@@ -603,17 +365,6 @@ async fn auth_middleware(
         return Err(StatusCode::UNAUTHORIZED);
     }
     let full_token = &auth_header[7..];
-
-    if full_token == "ozys_8f7e_8f7e50d578a699177eba16c7" {
-        let local_user = UserRecord {
-            name: "local_dev".to_string(),
-            role: "Lead".to_string(),
-            token: full_token.to_string(),
-            tenant_id: "local".to_string(),
-        };
-        request.extensions_mut().insert(local_user);
-        return Ok(next.run(request).await);
-    }
 
     if !full_token.starts_with("ozy_partner_ctx_") || !full_token.contains("_usr_") {
         return Err(StatusCode::UNAUTHORIZED);
@@ -668,6 +419,7 @@ async fn run_web_server(connection_cell: Arc<OnceCell<MemgraphConnection>>) -> a
         .route("/api/gpr/diff", get(handle_gpr_diff))
         .route("/api/gpr/merge", post(handle_gpr_merge))
         .layer(middleware::from_fn_with_state(connection_cell.clone(), auth_middleware))
+        .layer(middleware::from_fn(rate_limit_middleware))
         .with_state(connection_cell);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;

@@ -1,107 +1,39 @@
 use anyhow::Context;
-use serde::{Deserialize, Serialize};
-use serde_json::{json, Map, Value};
-use std::sync::Arc;
-use tokio::sync::OnceCell;
-use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
+use ozymem_core::mcp_common::{
+    self, InitializeResult, JsonRpcRequest, JsonRpcResponse, ServerCapabilities,
+    ServerInfo, ToolListResult, ToolsCapability,
+};
+use serde_json::Value;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, LazyLock, Mutex};
+use tokio::io::{self, AsyncBufReadExt, BufReader};
+use tokio::sync::OnceCell;
 
-#[derive(Debug, Deserialize)]
-struct JsonRpcRequest {
-    jsonrpc: String,
-    id: Option<Value>,
-    method: String,
-    #[serde(default)]
-    params: Option<Value>,
-}
-
-#[derive(Debug, Serialize)]
-struct JsonRpcResponse {
-    jsonrpc: &'static str,
-    id: Value,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    result: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<JsonRpcError>,
-}
-
-#[derive(Debug, Serialize)]
-struct JsonRpcError {
-    code: i64,
-    message: String,
-}
-
-#[derive(Debug, Serialize)]
-struct InitializeResult {
-    #[serde(rename = "protocolVersion")]
-    protocol_version: &'static str,
-    capabilities: ServerCapabilities,
-    #[serde(rename = "serverInfo")]
-    server_info: ServerInfo,
-}
-
-#[derive(Debug, Serialize)]
-struct ServerCapabilities {
-    tools: ToolsCapability,
-}
-
-#[derive(Debug, Serialize)]
-struct ToolsCapability {
-    #[serde(rename = "listChanged", skip_serializing_if = "Option::is_none")]
-    list_changed: Option<bool>,
-}
-
-#[derive(Debug, Serialize)]
-struct ServerInfo {
-    name: &'static str,
-    version: &'static str,
-}
-
-#[derive(Debug, Serialize)]
-struct ToolListResult {
-    tools: Vec<ToolDefinition>,
-}
-
-#[derive(Debug, Serialize)]
-struct ToolDefinition {
-    name: &'static str,
-    description: &'static str,
-    #[serde(rename = "inputSchema")]
-    input_schema: Value,
-}
-
-#[derive(Debug, Serialize)]
-struct ToolCallResult {
-    content: Vec<ContentBlock>,
-    #[serde(rename = "isError", skip_serializing_if = "Option::is_none")]
-    is_error: Option<bool>,
-}
-
-#[derive(Debug, Serialize)]
-struct ContentBlock {
-    #[serde(rename = "type")]
-    kind: &'static str,
-    text: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct ToolCallParams {
-    name: String,
-    #[serde(default)]
-    arguments: Map<String, Value>,
-}
+/// Tools exposed by the CLI MCP server (excludes `file_trace` which is server-only).
+const CLI_MCP_TOOLS: &[&str] = &[
+    "ozymem_get_schema",
+    "ozymem_find_symbol",
+    "graph_summary",
+    "file_context",
+    "record_lesson",
+];
 
 struct McpSession {
     current_project: Option<String>,
     project_path: Option<String>,
 }
 
-lazy_static::lazy_static! {
-    static ref SESSION: Mutex<McpSession> = Mutex::new(McpSession {
-        current_project: None,
-        project_path: None,
-    });
+static SESSION: LazyLock<Mutex<McpSession>> = LazyLock::new(|| Mutex::new(McpSession {
+    current_project: None,
+    project_path: None,
+}));
+
+fn clean_path_str(path_str: &str) -> String {
+    if path_str.starts_with(r"\\?\") {
+        path_str[4..].to_string()
+    } else {
+        path_str.to_string()
+    }
 }
 
 fn parse_root_uri(root_uri: &str) -> Option<String> {
@@ -117,17 +49,10 @@ fn parse_root_uri(root_uri: &str) -> Option<String> {
     Some(win_path)
 }
 
-fn clean_path_str(path_str: &str) -> String {
-    if path_str.starts_with(r"\\?\") {
-        path_str[4..].to_string()
-    } else {
-        path_str.to_string()
-    }
-}
-
 fn validate_project_path(path_str: &str) -> anyhow::Result<(String, String)> {
     let target_buf = PathBuf::from(path_str);
-    let canonical_target = target_buf.canonicalize()
+    let canonical_target = target_buf
+        .canonicalize()
         .context("Failed to canonicalize client root path")?;
     let clean_target = clean_path_str(&canonical_target.to_string_lossy());
 
@@ -145,8 +70,10 @@ fn validate_project_path(path_str: &str) -> anyhow::Result<(String, String)> {
 }
 
 pub async fn run_mcp_server() -> anyhow::Result<()> {
-    // Force logs to stderr to protect stdout data channel
-    eprintln!("[INFO] Iniciando servidor MCP de Ozymem... (OZYMEM_DAEMON={:?})", std::env::var("OZYMEM_DAEMON"));
+    eprintln!(
+        "[INFO] Iniciando servidor MCP de Ozymem... (OZYMEM_DAEMON={:?})",
+        std::env::var("OZYMEM_DAEMON")
+    );
 
     let connection_cell = Arc::new(OnceCell::new());
     let mut stdin = BufReader::new(io::stdin());
@@ -170,7 +97,7 @@ pub async fn run_mcp_server() -> anyhow::Result<()> {
 
         if let Ok(request) = serde_json::from_str::<JsonRpcRequest>(trimmed) {
             if let Some(response) = handle_request(&connection_cell, request).await? {
-                write_response(&mut stdout, &response).await?;
+                mcp_common::write_response(&mut stdout, &response).await?;
             }
         } else {
             eprintln!("[WARNING] Recibida línea no válida para JSON-RPC: {}", trimmed);
@@ -188,10 +115,11 @@ pub async fn run_mcp_server() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn get_connection(cell: &OnceCell<crate::BackendClient>) -> anyhow::Result<&crate::BackendClient> {
-    cell.get_or_try_init(|| async {
-        crate::build_backend_client().await
-    }).await
+async fn get_connection(
+    cell: &OnceCell<crate::BackendClient>,
+) -> anyhow::Result<&crate::BackendClient> {
+    cell.get_or_try_init(|| async { crate::build_backend_client().await })
+        .await
 }
 
 async fn handle_request(
@@ -199,7 +127,7 @@ async fn handle_request(
     request: JsonRpcRequest,
 ) -> anyhow::Result<Option<JsonRpcResponse>> {
     if request.jsonrpc != "2.0" {
-        return Ok(Some(error_response(
+        return Ok(Some(mcp_common::error_response(
             request.id.unwrap_or(Value::Null),
             -32600,
             "Invalid JSON-RPC version",
@@ -214,18 +142,25 @@ async fn handle_request(
         "initialize" => {
             let mut project_verified = false;
             if let Some(params) = &request.params {
-                eprintln!("[DEBUG] params: {}", serde_json::to_string(&params).unwrap_or_default());
-                let home_dir = home::home_dir().unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+                eprintln!(
+                    "[DEBUG] params: {}",
+                    serde_json::to_string(&params).unwrap_or_default()
+                );
+                let home_dir =
+                    home::home_dir().unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
                 if let Err(e) = std::fs::write(
                     home_dir.join(".ozymem-init-params.log"),
-                    serde_json::to_string_pretty(params).unwrap_or_default()
+                    serde_json::to_string_pretty(params).unwrap_or_default(),
                 ) {
                     eprintln!("[ERROR] Failed to write init params log: {:?}", e);
                 }
-                let root_uri = params.get("rootUri").and_then(Value::as_str)
+                let root_uri = params
+                    .get("rootUri")
+                    .and_then(Value::as_str)
                     .or_else(|| params.get("rootPath").and_then(Value::as_str))
                     .or_else(|| {
-                        params.get("workspaceFolders")
+                        params
+                            .get("workspaceFolders")
                             .and_then(Value::as_array)
                             .and_then(|folders| folders.first())
                             .and_then(|folder| folder.get("uri"))
@@ -237,21 +172,29 @@ async fn handle_request(
                         eprintln!("[DEBUG] decoded_path: {}", decoded_path);
                         match validate_project_path(&decoded_path) {
                             Ok((name, path)) => {
-                                let mut session = SESSION.lock().unwrap();
+                                let mut session = SESSION.lock().unwrap_or_else(|e| e.into_inner());
                                 session.current_project = Some(name.clone());
                                 session.project_path = Some(path.clone());
                                 project_verified = true;
-                                eprintln!("[INFO] MCP inicializado para proyecto registrado: {} ({})", name, path);
+                                eprintln!(
+                                    "[INFO] MCP inicializado para proyecto registrado: {} ({})",
+                                    name, path
+                                );
                             }
                             Err(e) => {
-                                let home_dir = home::home_dir().unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+                                let home_dir = home::home_dir().unwrap_or_else(|| {
+                                    std::env::current_dir().unwrap_or_default()
+                                });
                                 if let Err(err) = std::fs::write(
                                     home_dir.join(".ozymem-init-error.log"),
-                                    format!("Path: {}\nError: {:?}", decoded_path, e)
+                                    format!("Path: {}\nError: {:?}", decoded_path, e),
                                 ) {
                                     eprintln!("[ERROR] Failed to write init error log: {:?}", err);
                                 }
-                                eprintln!("[WARNING] MCP rechazó inicialización en ruta no registrada: {}. Detalle: {:?}", decoded_path, e);
+                                eprintln!(
+                                    "[WARNING] MCP rechazó inicialización en ruta no registrada: {}. Detalle: {:?}",
+                                    decoded_path, e
+                                );
                             }
                         }
                     }
@@ -265,11 +208,13 @@ async fn handle_request(
                 let load_res = crate::load_config();
                 diag_msg = format!(
                     "Fallback failed. load_config result: {:?}. ",
-                    load_res.as_ref().map(|(_, c)| format!("Projects keys: {:?}", c.projects.keys().collect::<Vec<_>>()))
+                    load_res
+                        .as_ref()
+                        .map(|(_, c)| format!("Projects keys: {:?}", c.projects.keys().collect::<Vec<_>>()))
                 );
                 if let Ok((_, config)) = load_res {
                     if let Some((name, path)) = config.projects.iter().next() {
-                        let mut session = SESSION.lock().unwrap();
+                        let mut session = SESSION.lock().unwrap_or_else(|e| e.into_inner());
                         session.current_project = Some(name.clone());
                         session.project_path = Some(path.clone());
                         project_verified = true;
@@ -279,15 +224,16 @@ async fn handle_request(
             }
 
             if !project_verified {
-                let root_uri_str = request.params.as_ref()
+                let root_uri_str = request
+                    .params
+                    .as_ref()
                     .and_then(|p| p.get("rootUri").and_then(Value::as_str))
                     .unwrap_or("None");
                 let err_msg = format!(
                     "Directorio no registrado. rootUri: {}. Diag: {}",
-                    root_uri_str,
-                    diag_msg
+                    root_uri_str, diag_msg
                 );
-                return Ok(Some(error_response(id, -32603, &err_msg)));
+                return Ok(Some(mcp_common::error_response(id, -32603, &err_msg)));
             }
 
             let payload = InitializeResult {
@@ -303,307 +249,71 @@ async fn handle_request(
                 },
             };
 
-            ok_response(id, serde_json::to_value(payload)?)
+            mcp_common::ok_response(id, serde_json::to_value(payload)?)
         }
         "notifications/initialized" => return Ok(None),
         "tools/list" => {
             let payload = ToolListResult {
-                tools: vec![
-                    ToolDefinition {
-                        name: "ozymem_get_schema",
-                        description: "Obtener esquema general de archivos e idiomas del proyecto actual registrado en Memgraph.",
-                        input_schema: json!({
-                            "type": "object",
-                            "properties": {},
-                            "additionalProperties": false
-                        }),
-                    },
-                    ToolDefinition {
-                        name: "ozymem_find_symbol",
-                        description: "Buscar la ubicación de un símbolo/función específico por nombre dentro del proyecto.",
-                        input_schema: json!({
-                            "type": "object",
-                            "properties": {
-                                "symbol_name": {
-                                    "type": "string",
-                                    "description": "Nombre del símbolo o función a buscar"
-                                }
-                            },
-                            "required": ["symbol_name"],
-                            "additionalProperties": false
-                        }),
-                    },
-                    ToolDefinition {
-                        name: "graph_summary",
-                        description: "Summarize the indexed graph with file and function counts.",
-                        input_schema: json!({
-                            "type": "object",
-                            "properties": {},
-                            "additionalProperties": false
-                        }),
-                    },
-                    ToolDefinition {
-                        name: "file_context",
-                        description: "Return the indexed file context, including language, strategy, and functions.",
-                        input_schema: json!({
-                            "type": "object",
-                            "properties": {
-                                "file_path": {
-                                    "type": "string",
-                                    "description": "Path used when the file was indexed"
-                                }
-                            },
-                            "required": ["file_path"],
-                            "additionalProperties": false
-                        }),
-                    },
-                    ToolDefinition {
-                        name: "record_lesson",
-                        description: "Record an error-to-fix lesson for a file or symbol as historical memory.",
-                        input_schema: json!({
-                            "type": "object",
-                            "properties": {
-                                "file_path": {
-                                    "type": "string",
-                                    "description": "Absolute path of the file that failed"
-                                },
-                                "symbol_name": {
-                                    "type": "string",
-                                    "description": "Optional name of the class or function where the error occurred"
-                                },
-                                "error_context": {
-                                    "type": "string",
-                                    "description": "Details about the error context or compilation message"
-                                },
-                                "solution": {
-                                    "type": "string",
-                                    "description": "Short fix or lesson learned"
-                                }
-                            },
-                            "required": ["file_path", "error_context", "solution"],
-                            "additionalProperties": false
-                        }),
-                    },
-                ],
+                tools: mcp_common::get_tools_list()
+                    .into_iter()
+                    .filter(|t| CLI_MCP_TOOLS.contains(&t.name))
+                    .collect(),
             };
 
-            ok_response(id, serde_json::to_value(payload)?)
+            mcp_common::ok_response(id, serde_json::to_value(payload)?)
         }
         "tools/call" => {
             let params = request
                 .params
                 .ok_or_else(|| anyhow::anyhow!("missing params for tools/call"))?;
-            let tool_call: ToolCallParams = serde_json::from_value(params)?;
+            let tool_call: mcp_common::ToolCallParams = serde_json::from_value(params)?;
 
-            let session = SESSION.lock().unwrap();
-            let Some(proj_path) = &session.project_path else {
-                return Ok(Some(error_response(id, -32603, "MCP no inicializado con un proyecto válido")));
+            let session = SESSION.lock().unwrap_or_else(|e| e.into_inner());
+            let project_name = session.current_project.as_deref();
+            let proj_path = session.project_path.as_deref();
+
+            let Some(proj_path) = proj_path else {
+                return Ok(Some(mcp_common::error_response(
+                    id,
+                    -32603,
+                    "MCP no inicializado con un proyecto válido",
+                )));
             };
 
-            // Establish connection lazily
             let connection = match get_connection(connection_cell).await {
                 Ok(conn) => conn,
                 Err(e) => {
-                    return Ok(Some(error_response(id, -32603, &format!("Memgraph connection failed: {:?}", e))));
+                    return Ok(Some(mcp_common::error_response(
+                        id,
+                        -32603,
+                        &format!("Memgraph connection failed: {:?}", e),
+                    )));
                 }
             };
 
-            let payload = match tool_call.name.as_str() {
-                "ozymem_get_schema" => {
-                    let summary = match connection.get_graph_summary().await {
-                        Ok(s) => s,
-                        Err(e) => {
-                            return Ok(Some(error_response(id, -32603, &format!("Memgraph query error: {:?}", e))));
-                        }
-                    };
-
-                    let body = format!(
-                        "Proyecto Activo: {}\nRuta: {}\nTotal Archivos: {}\nTotal Funciones Mapeadas: {}\nTotal Engramas Formados: {}",
-                        session.current_project.as_deref().unwrap_or(""),
-                        proj_path,
-                        summary.file_count,
-                        summary.function_count,
-                        summary.engram_count
-                    );
-
-                    ToolCallResult {
-                        content: vec![ContentBlock {
-                            kind: "text",
-                            text: body,
-                        }],
-                        is_error: None,
-                    }
-                }
-                "ozymem_find_symbol" => {
-                    let symbol_name = tool_call.arguments.get("symbol_name")
-                        .and_then(Value::as_str)
-                        .ok_or_else(|| anyhow::anyhow!("missing symbol_name argument"))?;
-
-                    let results = match connection.find_symbol(symbol_name, proj_path).await {
-                        Ok(res) => res,
-                        Err(e) => {
-                            return Ok(Some(error_response(id, -32603, &format!("Find symbol error: {:?}", e))));
-                        }
-                    };
-
-                    let body = if results.is_empty() {
-                        format!("Símbolo '{}' no encontrado en el proyecto '{}'.", symbol_name, session.current_project.as_deref().unwrap_or(""))
-                    } else {
-                        format!("Resultados para la búsqueda de '{}':\n{}", symbol_name, results.join("\n"))
-                    };
-
-                    ToolCallResult {
-                        content: vec![ContentBlock {
-                            kind: "text",
-                            text: body,
-                        }],
-                        is_error: None,
-                    }
-                }
-                "graph_summary" => {
-                    let summary = connection.get_graph_summary().await?;
-                    ToolCallResult {
-                        content: vec![ContentBlock {
-                            kind: "text",
-                            text: format_graph_summary(&summary),
-                        }],
-                        is_error: None,
-                    }
-                }
-                "file_context" => {
-                    let file_path = read_string_argument(&tool_call.arguments, "file_path")
-                        .or_else(|_| read_string_argument(&tool_call.arguments, "path"))?;
-                    let context = connection.get_file_context(&file_path).await?;
-                    let historical_engrams = connection
-                        .get_historical_engram_solutions(&file_path)
-                        .await?;
-                    let body = format_file_context(context.as_ref(), &file_path);
-                    ToolCallResult {
-                        content: vec![ContentBlock {
-                            kind: "text",
-                            text: prepend_historical_engrams(&historical_engrams, body),
-                        }],
-                        is_error: None,
-                    }
-                }
-                "record_lesson" => {
-                    let file_path = read_string_argument(&tool_call.arguments, "file_path")?;
-                    let symbol_name = tool_call.arguments.get("symbol_name")
-                        .and_then(Value::as_str);
-                    let error_context = read_string_argument(&tool_call.arguments, "error_context")?;
-                    let solution = read_string_argument(&tool_call.arguments, "solution")?;
-
-                    connection
-                        .record_lesson(&file_path, symbol_name, &error_context, &solution)
-                        .await?;
-
-                    ToolCallResult {
-                        content: vec![ContentBlock {
-                            kind: "text",
-                            text: format!(
-                                "Recorded lesson for {file_path}{}",
-                                symbol_name.map(|s| format!("::{}", s)).unwrap_or_default()
-                            ),
-                        }],
-                        is_error: None,
-                    }
-                }
-                _ => {
-                    return Ok(Some(error_response(id, -32601, "Unknown tool")));
+            let payload = match mcp_common::handle_mcp_tool_call(
+                connection as &dyn mcp_common::McpBackend,
+                &tool_call.name,
+                &tool_call.arguments,
+                project_name,
+                Some(proj_path),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(e) => {
+                    return Ok(Some(mcp_common::error_response(
+                        id,
+                        -32603,
+                        &format!("Tool call error: {:?}", e),
+                    )));
                 }
             };
 
-            ok_response(id, serde_json::to_value(payload)?)
+            mcp_common::ok_response(id, serde_json::to_value(payload)?)
         }
-        _ => error_response(id, -32601, "Method not found"),
+        _ => mcp_common::error_response(id, -32601, "Method not found"),
     };
 
     Ok(Some(response))
 }
-
-fn format_file_context(context: Option<&ozymem_core::FileGraphContext>, file_path: &str) -> String {
-    let Some(context) = context else {
-        return format!("No indexed file found for {file_path}");
-    };
-
-    let mut output = format!(
-        "File: {}\nLanguage: {}\nFunctions: {}",
-        context.file_path,
-        context.language,
-        context.functions.len()
-    );
-
-    for function in &context.functions {
-        output.push_str(&format!(
-            "\n- {} [{}] lines {}-{} via {}",
-            function.name, function.kind, function.start_line, function.end_line, function.strategy
-        ));
-    }
-
-    output
-}
-
-fn prepend_historical_engrams(history: &[String], body: String) -> String {
-    if history.is_empty() {
-        return body;
-    }
-
-    let mut output = String::from("[HISTORICAL ENGRAMS FOR THIS FILE:\n");
-    for solution in history {
-        output.push_str(&format!("- {solution}\n"));
-    }
-    output.push_str("]\n\n");
-    output.push_str(&body);
-    output
-}
-
-fn format_graph_summary(summary: &ozymem_core::GraphSummary) -> String {
-    format!(
-        "Files: {}\nFunctions: {}\nEngrams: {}\nNative AST functions: {}\nExtension WASM functions: {}\nText heuristic functions: {}",
-        summary.file_count,
-        summary.function_count,
-        summary.engram_count,
-        summary.native_ast_function_count,
-        summary.extension_wasm_function_count,
-        summary.text_heuristic_function_count
-    )
-}
-
-fn read_string_argument(arguments: &Map<String, Value>, key: &str) -> anyhow::Result<String> {
-    arguments
-        .get(key)
-        .and_then(Value::as_str)
-        .map(|value| value.to_string())
-        .ok_or_else(|| anyhow::anyhow!("missing required string argument: {key}"))
-}
-
-async fn write_response(writer: &mut io::Stdout, response: &JsonRpcResponse) -> anyhow::Result<()> {
-    let payload = serde_json::to_string(response)?;
-    writer.write_all(format!("{}\n", payload).as_bytes()).await?;
-    writer.flush().await?;
-    Ok(())
-}
-
-fn ok_response(id: Value, result: Value) -> JsonRpcResponse {
-    JsonRpcResponse {
-        jsonrpc: "2.0",
-        id,
-        result: Some(result),
-        error: None,
-    }
-}
-
-fn error_response(id: Value, code: i64, message: &str) -> JsonRpcResponse {
-    JsonRpcResponse {
-        jsonrpc: "2.0",
-        id,
-        result: None,
-        error: Some(JsonRpcError {
-            code,
-            message: message.to_string(),
-        }),
-    }
-}
-
-
-

@@ -1,8 +1,8 @@
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use ozymem_core::{
-    default_memgraph_database, default_memgraph_uri, FileGraphContext, GraphSummary, LessonRecord,
-    MemgraphConfig, MemgraphConnection, StoredFunction,
+    default_memgraph_database, default_memgraph_uri, fs_utils, FileGraphContext, GraphSummary,
+    LessonRecord, MemgraphConfig, MemgraphConnection, StoredFunction,
 };
 use ozymem_parser::{
     extract_dependency_hints, is_binary_file, is_internal_dependency_hint, parse_source,
@@ -256,7 +256,7 @@ impl BackendClient {
                         let (_, cfg) = load_config().ok()?;
                         cfg.token
                     })
-                    .unwrap_or_else(|| "ozys_8f7e_8f7e50d578a699177eba16c7".to_string())
+                    .unwrap_or_else(|| String::new())
             }
             BackendMode::Remote { token, .. } => token.clone(),
         };
@@ -622,7 +622,7 @@ impl BackendClient {
                         let (_, cfg) = load_config().ok()?;
                         cfg.token
                     })
-                    .unwrap_or_else(|| "ozys_8f7e_8f7e50d578a699177eba16c7".to_string());
+                    .unwrap_or_else(|| String::new());
                 
                 let tenant_id = if token.starts_with("ozy_partner_ctx_") && token.contains("_usr_") {
                     let trimmed = &token["ozy_partner_ctx_".len()..];
@@ -696,6 +696,37 @@ impl BackendClient {
     }
 }
 
+#[async_trait::async_trait]
+impl ozymem_core::mcp_common::McpBackend for BackendClient {
+    fn tenant_id(&self) -> String {
+        self.tenant_id()
+    }
+
+    async fn get_graph_summary(&self) -> anyhow::Result<GraphSummary> {
+        self.get_graph_summary().await
+    }
+
+    async fn get_file_context(&self, file_path: &str) -> anyhow::Result<Option<FileGraphContext>> {
+        self.get_file_context(file_path).await
+    }
+
+    async fn get_historical_engram_solutions(&self, file_path: &str) -> anyhow::Result<Vec<String>> {
+        self.get_historical_engram_solutions(file_path).await
+    }
+
+    async fn record_lesson(&self, file_path: &str, symbol_name: Option<&str>, error_context: &str, solution: &str) -> anyhow::Result<()> {
+        self.record_lesson(file_path, symbol_name, error_context, solution).await
+    }
+
+    async fn get_incoming_dependencies(&self, file_path: &str) -> anyhow::Result<Vec<String>> {
+        self.get_incoming_dependencies(file_path).await
+    }
+
+    async fn find_symbol(&self, symbol_name: &str, project_path: &str) -> anyhow::Result<Vec<String>> {
+        self.find_symbol(symbol_name, project_path).await
+    }
+}
+
 struct AppContext {
     connection: BackendClient,
     display_uri: String,
@@ -730,6 +761,148 @@ fn parse_unified_credential(cred: &str) -> Option<(String, String)> {
         return None;
     }
     Some((parts[0].to_string(), parts[1].to_string()))
+}
+
+struct McpTarget {
+    name: &'static str,
+    path: PathBuf,
+}
+
+fn resolve_ozymem_binary(home_dir: &Path) -> String {
+    let ozymem_path = home_dir.join(".cargo").join("bin").join(if cfg!(windows) { "ozymem.exe" } else { "ozymem" });
+    if ozymem_path.exists() {
+        ozymem_path.to_string_lossy().to_string()
+    } else {
+        "ozymem".to_string()
+    }
+}
+
+fn write_mcp_server_config(path: &Path, mcp_key: &str, mcp_value: &serde_json::Value) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let content = if path.exists() {
+        std::fs::read_to_string(path).unwrap_or_default()
+    } else {
+        String::new()
+    };
+
+    let mut json_val: serde_json::Value = if content.trim().is_empty() {
+        serde_json::json!({"mcpServers": {}})
+    } else {
+        serde_json::from_str(&content).unwrap_or_else(|_| {
+            serde_json::json!({"mcpServers": {}})
+        })
+    };
+
+    if let Some(mcp_servers) = json_val.get_mut("mcpServers") {
+        if let Some(mcp_servers_obj) = mcp_servers.as_object_mut() {
+            mcp_servers_obj.insert(mcp_key.to_string(), mcp_value.clone());
+        }
+    } else if let Some(obj) = json_val.as_object_mut() {
+        let mut servers = serde_json::Map::new();
+        servers.insert(mcp_key.to_string(), mcp_value.clone());
+        obj.insert("mcpServers".to_string(), serde_json::Value::Object(servers));
+    }
+
+    let pretty_json = serde_json::to_string_pretty(&json_val)?;
+    std::fs::write(path, pretty_json)?;
+    Ok(())
+}
+
+fn select_mcp_target(detect_targets: Vec<McpTarget>) -> anyhow::Result<Option<McpTarget>> {
+    let mut detected: Vec<McpTarget> = detect_targets.into_iter().filter(|t| t.path.exists()).collect();
+
+    let selected = if detected.is_empty() {
+        println!("No se detectó ningún archivo de configuración MCP activo.");
+
+        let all_targets = mcp_targets();
+        for (i, target) in all_targets.iter().enumerate() {
+            println!("{}) {}", i + 1, target.name);
+        }
+        print!("Selecciona una opción para inicializarla (Enter para omitir): ");
+        std::io::Write::flush(&mut std::io::stdout())?;
+
+        let mut choice_str = String::new();
+        std::io::stdin().read_line(&mut choice_str)?;
+        choice_str.trim().parse::<usize>().ok().and_then(|c| {
+            if c >= 1 && c <= all_targets.len() {
+                Some(all_targets.into_iter().nth(c - 1).unwrap())
+            } else {
+                None
+            }
+        })
+    } else if detected.len() == 1 {
+        Some(detected.remove(0))
+    } else {
+        println!("Entornos MCP detectados:");
+        for (i, target) in detected.iter().enumerate() {
+            println!("  {}) {} [{}]", i + 1, target.name, target.path.display());
+        }
+        print!("Selecciona el número del entorno a configurar (Enter para omitir): ");
+        std::io::Write::flush(&mut std::io::stdout())?;
+
+        let mut choice_str = String::new();
+        std::io::stdin().read_line(&mut choice_str)?;
+        match choice_str.trim().parse::<usize>().ok() {
+            Some(idx) if idx >= 1 && idx <= detected.len() => Some(detected.remove(idx - 1)),
+            _ => None,
+        }
+    };
+
+    Ok(selected)
+}
+
+fn mcp_targets() -> Vec<McpTarget> {
+    let home_dir = home::home_dir().expect("No se pudo determinar el directorio home.");
+    let appdata = || -> PathBuf {
+        std::env::var("APPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| home_dir.join("AppData").join("Roaming"))
+    };
+    let cursor_path = || -> PathBuf {
+        if cfg!(target_os = "windows") {
+            appdata().join("Cursor").join("User").join("globalStorage").join("cursor.mcp.json")
+        } else if cfg!(target_os = "macos") {
+            home_dir.join("Library").join("Application Support").join("Cursor").join("User").join("globalStorage").join("cursor.mcp.json")
+        } else {
+            home_dir.join(".config").join("Cursor").join("User").join("globalStorage").join("cursor.mcp.json")
+        }
+    };
+    let claude_path = || -> PathBuf {
+        if cfg!(target_os = "windows") {
+            appdata().join("Claude").join("claude_desktop_config.json")
+        } else if cfg!(target_os = "macos") {
+            home_dir.join("Library").join("Application Support").join("Claude").join("claude_desktop_config.json")
+        } else {
+            home_dir.join(".config").join("Claude").join("claude_desktop_config.json")
+        }
+    };
+    let vscode_path = || -> PathBuf {
+        if cfg!(target_os = "windows") {
+            appdata().join("Code").join("User").join("globalStorage").join("saoudrizwan.claude-dev").join("settings").join("mcp_config.json")
+        } else if cfg!(target_os = "macos") {
+            home_dir.join("Library").join("Application Support").join("Code").join("User").join("globalStorage").join("saoudrizwan.claude-dev").join("settings").join("mcp_config.json")
+        } else {
+            home_dir.join(".config").join("Code").join("User").join("globalStorage").join("saoudrizwan.claude-dev").join("settings").join("mcp_config.json")
+        }
+    };
+    let windsurf_path = || -> PathBuf {
+        if cfg!(target_os = "windows") {
+            appdata().join("Windsurf").join("globalStorage").join("windsurf.mcp.json")
+        } else if cfg!(target_os = "macos") {
+            home_dir.join("Library").join("Application Support").join("Windsurf").join("globalStorage").join("windsurf.mcp.json")
+        } else {
+            home_dir.join(".config").join("Windsurf").join("globalStorage").join("windsurf.mcp.json")
+        }
+    };
+    vec![
+        McpTarget { name: "VS Code (Claude Dev Extension)", path: vscode_path() },
+        McpTarget { name: "Cursor Editor", path: cursor_path() },
+        McpTarget { name: "Windsurf IDE", path: windsurf_path() },
+        McpTarget { name: "Claude Desktop", path: claude_path() },
+    ]
 }
 
 async fn run_mcp_install() -> anyhow::Result<()> {
@@ -797,189 +970,23 @@ async fn run_mcp_install() -> anyhow::Result<()> {
         }
     }
 
-    // Inyectar en Cursor/VS Code
+    // Inyectar en Cursor/VS Code/Windsurf/Claude Desktop
     let home_dir = home::home_dir().context("No se pudo determinar el directorio home.")?;
-    let cursor_path = if cfg!(target_os = "windows") {
-        let appdata = std::env::var("APPDATA")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| home_dir.join("AppData").join("Roaming"));
-        appdata.join("Cursor").join("User").join("globalStorage").join("saoudrizwan.claude-dev").join("settings").join("mcp_config.json")
-    } else if cfg!(target_os = "macos") {
-        home_dir.join("Library").join("Application Support").join("Cursor").join("User").join("globalStorage").join("saoudrizwan.claude-dev").join("settings").join("mcp_config.json")
-    } else {
-        home_dir.join(".config").join("Cursor").join("User").join("globalStorage").join("saoudrizwan.claude-dev").join("settings").join("mcp_config.json")
-    };
-
-    let claude_path = if cfg!(target_os = "windows") {
-        let appdata = std::env::var("APPDATA")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| home_dir.join("AppData").join("Roaming"));
-        appdata.join("Claude").join("claude_desktop_config.json")
-    } else if cfg!(target_os = "macos") {
-        home_dir.join("Library").join("Application Support").join("Claude").join("claude_desktop_config.json")
-    } else {
-        home_dir.join(".config").join("Claude").join("claude_desktop_config.json")
-    };
-
-    struct McpTarget {
-        name: &'static str,
-        path: PathBuf,
-    }
-
-    let targets = vec![
-        McpTarget {
-            name: "VS Code (Antigravity / Claude Dev)",
-            path: home_dir.join(".gemini").join("antigravity").join("mcp_config.json"),
-        },
-        McpTarget {
-            name: "Cursor Editor",
-            path: cursor_path,
-        },
-        McpTarget {
-            name: "Claude Desktop",
-            path: claude_path,
-        },
-    ];
-
-    let mut detected = Vec::new();
-    for target in targets {
-        if target.path.exists() {
-            detected.push(target);
+    let ozymem_cmd = resolve_ozymem_binary(&home_dir);
+    let mcp_key = format!("ozymem-partner-{}", server_uuid);
+    let mcp_value = serde_json::json!({
+        "command": ozymem_cmd,
+        "args": ["mcp", "run"],
+        "env": {
+            "OZYMEM_SERVER_URL": server_url.trim().to_string(),
+            "OZYMEM_SERVER_ID": server_uuid.clone(),
+            "OZYMEM_USER_TOKEN": user_token.clone()
         }
-    }
+    });
 
-    let selected_target = if detected.is_empty() {
-        println!("No se detectó ningún archivo de configuración MCP activo.");
-        println!("1) VS Code (Antigravity / Claude Dev)");
-        println!("2) Cursor Editor");
-        println!("3) Claude Desktop");
-        print!("Selecciona una opción para inicializarla (Enter para omitir): ");
-        use std::io::Write;
-        std::io::stdout().flush()?;
-        
-        let mut choice_str = String::new();
-        std::io::stdin().read_line(&mut choice_str)?;
-        let choice = choice_str.trim().parse::<usize>().ok();
-        
-        let targets_all = vec![
-            McpTarget {
-                name: "VS Code (Antigravity / Claude Dev)",
-                path: home_dir.join(".gemini").join("antigravity").join("mcp_config.json"),
-            },
-            McpTarget {
-                name: "Cursor Editor",
-                path: if cfg!(target_os = "windows") {
-                    let appdata = std::env::var("APPDATA")
-                        .map(PathBuf::from)
-                        .unwrap_or_else(|_| home_dir.join("AppData").join("Roaming"));
-                    appdata.join("Cursor").join("User").join("globalStorage").join("saoudrizwan.claude-dev").join("settings").join("mcp_config.json")
-                } else if cfg!(target_os = "macos") {
-                    home_dir.join("Library").join("Application Support").join("Cursor").join("User").join("globalStorage").join("saoudrizwan.claude-dev").join("settings").join("mcp_config.json")
-                } else {
-                    home_dir.join(".config").join("Cursor").join("User").join("globalStorage").join("saoudrizwan.claude-dev").join("settings").join("mcp_config.json")
-                },
-            },
-            McpTarget {
-                name: "Claude Desktop",
-                path: if cfg!(target_os = "windows") {
-                    let appdata = std::env::var("APPDATA")
-                        .map(PathBuf::from)
-                        .unwrap_or_else(|_| home_dir.join("AppData").join("Roaming"));
-                    appdata.join("Claude").join("claude_desktop_config.json")
-                } else if cfg!(target_os = "macos") {
-                    home_dir.join("Library").join("Application Support").join("Claude").join("claude_desktop_config.json")
-                } else {
-                    home_dir.join(".config").join("Claude").join("claude_desktop_config.json")
-                },
-            },
-        ];
-        
-        match choice {
-            Some(1) => targets_all.into_iter().nth(0),
-            Some(2) => targets_all.into_iter().nth(1),
-            Some(3) => targets_all.into_iter().nth(2),
-            _ => None,
-        }
-    } else {
-        println!("Entornos MCP detectados:");
-        for (i, target) in detected.iter().enumerate() {
-            println!("  {}) {}", i + 1, target.name);
-        }
-        print!("Selecciona el número del entorno a configurar (Enter para omitir): ");
-        use std::io::Write;
-        std::io::stdout().flush()?;
-        
-        let mut choice_str = String::new();
-        std::io::stdin().read_line(&mut choice_str)?;
-        let choice = choice_str.trim().parse::<usize>().ok();
-        match choice {
-            Some(idx) if idx > 0 && idx <= detected.len() => {
-                Some(detected.remove(idx - 1))
-            }
-            _ => None,
-        }
-    };
-
-    if let Some(target) = selected_target {
-        let path = target.path;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        
-        let content = if path.exists() {
-            std::fs::read_to_string(&path).unwrap_or_default()
-        } else {
-            String::new()
-        };
-
-        let mut json_val: serde_json::Value = if content.trim().is_empty() {
-            serde_json::json!({
-                "mcpServers": {}
-            })
-        } else {
-            serde_json::from_str(&content).unwrap_or_else(|_| {
-                serde_json::json!({
-                    "mcpServers": {}
-                })
-            })
-        };
-
-        let ozymem_path = home_dir.join(".cargo").join("bin").join(if cfg!(windows) { "ozymem.exe" } else { "ozymem" });
-        let ozymem_cmd = if ozymem_path.exists() {
-            ozymem_path.to_string_lossy().to_string()
-        } else {
-            "ozymem".to_string()
-        };
-
-        let mcp_key = format!("ozymem-partner-{}", server_uuid);
-        let mcp_config_value = serde_json::json!({
-            "command": ozymem_cmd,
-            "args": ["mcp", "run"],
-            "env": {
-                "OZYMEM_SERVER_URL": server_url.trim().to_string(),
-                "OZYMEM_SERVER_ID": server_uuid.clone(),
-                "OZYMEM_USER_TOKEN": user_token.clone()
-            }
-        });
-
-        if let Some(mcp_servers) = json_val.get_mut("mcpServers") {
-            if let Some(mcp_servers_obj) = mcp_servers.as_object_mut() {
-                mcp_servers_obj.insert(mcp_key, mcp_config_value);
-            }
-        } else {
-            if let Some(obj) = json_val.as_object_mut() {
-                obj.insert(
-                    "mcpServers".to_string(),
-                    serde_json::json!({
-                        mcp_key: mcp_config_value
-                    })
-                );
-            }
-        }
-
-        let pretty_json = serde_json::to_string_pretty(&json_val)?;
-        std::fs::write(&path, pretty_json)?;
-        println!("[SUCCESS] Configuración inyectada con éxito en: {}", path.display());
+    if let Some(target) = select_mcp_target(mcp_targets())? {
+        write_mcp_server_config(&target.path, &mcp_key, &mcp_value)?;
+        println!("[SUCCESS] Configuración inyectada con éxito en: {}", target.path.display());
     }
 
     Ok(())
@@ -1007,53 +1014,11 @@ async fn run_gpr_push(message: String) -> anyhow::Result<()> {
             return true;
         };
 
-        let name_lower = name.to_lowercase();
-        let path_str_lower = path.to_string_lossy().to_lowercase();
-
-        if CARPETAS_EXCLUIDAS.iter().any(|&excl| name_lower == excl) {
+        if CARPETAS_EXCLUIDAS.iter().any(|&excl| name.eq_ignore_ascii_case(excl)) {
             return false;
         }
 
-        if name_lower == "appdata"
-            || name_lower == "program files"
-            || name_lower == "programdata"
-            || name_lower == "system32"
-            || name_lower == "windows"
-            || name_lower == ".svn"
-            || name_lower == "node_modules"
-            || name_lower == "__pycache__"
-            || name_lower == ".venv"
-            || name_lower == "env"
-            || name_lower == "target"
-            || name_lower == "dist"
-            || name_lower == "build"
-            || name_lower == "ebwebview"
-            || name_lower == "bravesoftware"
-            || path_str_lower.contains("google/chrome")
-            || path_str_lower.contains("google\\chrome")
-            || path_str_lower.contains("microsoft/edge")
-            || path_str_lower.contains("microsoft\\edge")
-            || name_lower == "cache"
-            || name_lower == "local storage"
-            || name_lower == ".cursor"
-            || name_lower == ".vscode"
-            || name_lower == ".idea"
-            || name_lower == ".config"
-            || name_lower == ".anthropic"
-            || name_lower == ".ollama"
-        {
-            return false;
-        }
-
-        if name.starts_with('.') && name != "." {
-            return false;
-        }
-
-        if is_ignored_by_patterns(path, &ignore_patterns, &project_root) {
-            return false;
-        }
-
-        true
+        !fs_utils::should_skip_path(path, &ignore_patterns, &project_root)
     };
 
     println!("GPR: Analizando archivos en el proyecto actual...");
@@ -1086,7 +1051,7 @@ async fn run_gpr_push(message: String) -> anyhow::Result<()> {
             Ok(canonical) => canonical,
             Err(_) => continue,
         };
-        let absolute_file_path = clean_path(&absolute_path);
+        let absolute_file_path = fs_utils::clean_path(&absolute_path);
 
         let source_code = match fs::read_to_string(path) {
             Ok(contents) => contents,
@@ -1390,7 +1355,7 @@ async fn main() -> anyhow::Result<()> {
                 } else {
                     std::env::current_dir()?.join(&file_path)
                 };
-                let sanitized_path = clean_path(&absolute_path);
+                let sanitized_path = fs_utils::clean_path(&absolute_path);
                 match context.connection.delete_file_definition(&sanitized_path).await {
                     Ok(true) => {
                         println!("[Core] El archivo {} y sus funciones fueron eliminados del grafo.", sanitized_path);
@@ -1441,7 +1406,7 @@ pub async fn build_backend_client() -> anyhow::Result<BackendClient> {
     };
 
     let host = host_env.unwrap_or_else(|| config.current_brain.clone());
-    let token = token_env.unwrap_or_else(|| "ozys_8f7e_8f7e50d578a699177eba16c7".to_string());
+    let token = token_env.unwrap_or_else(|| String::new());
 
     if host.starts_with("http://") || host.starts_with("https://") {
         let client = reqwest::Client::new();
@@ -1600,10 +1565,10 @@ async fn scan_directory(
     if !force {
         let mut path_is_registered = false;
         if let Ok((_, config)) = load_config() {
-            let clean_target_lower = clean_path(&canonical_target).to_lowercase();
+            let clean_target_lower = fs_utils::clean_path(&canonical_target).to_lowercase();
             for (_, registered_path_str) in &config.projects {
                 if let Ok(reg_path_buf) = PathBuf::from(registered_path_str).canonicalize() {
-                    let clean_reg_path_lower = clean_path(&reg_path_buf).to_lowercase();
+                    let clean_reg_path_lower = fs_utils::clean_path(&reg_path_buf).to_lowercase();
                     if clean_target_lower == clean_reg_path_lower 
                         || clean_target_lower.starts_with(&format!("{}\\", clean_reg_path_lower)) 
                         || clean_target_lower.starts_with(&format!("{}/", clean_reg_path_lower)) 
@@ -1652,70 +1617,11 @@ async fn scan_directory(
             return true;
         };
 
-        let name_lower = name.to_lowercase();
-        let path_str_lower = path.to_string_lossy().to_lowercase();
-
-        // Carpetas excluidas estrictas (evita lectura/recorrido)
-        if CARPETAS_EXCLUIDAS.iter().any(|&excl| name_lower == excl) {
+        if CARPETAS_EXCLUIDAS.iter().any(|&excl| name.eq_ignore_ascii_case(excl)) {
             return false;
         }
 
-        // Carpetas de Sistema
-        if name_lower == "appdata"
-            || name_lower == "program files"
-            || name_lower == "programdata"
-            || name_lower == "system32"
-            || name_lower == "windows"
-            || name_lower == ".svn"
-        {
-            return false;
-        }
-
-        // Entornos de Desarrollo
-        if name_lower == "node_modules"
-            || name_lower == "__pycache__"
-            || name_lower == ".venv"
-            || name_lower == "env"
-            || name_lower == "target"
-            || name_lower == "dist"
-            || name_lower == "build"
-        {
-            return false;
-        }
-
-        // Navegadores y WebViews
-        if name_lower == "ebwebview"
-            || name_lower == "bravesoftware"
-            || path_str_lower.contains("google/chrome")
-            || path_str_lower.contains("google\\chrome")
-            || path_str_lower.contains("microsoft/edge")
-            || path_str_lower.contains("microsoft\\edge")
-            || name_lower == "cache"
-            || name_lower == "local storage"
-        {
-            return false;
-        }
-
-        // Herramientas de IA y Editores
-        if name_lower == ".cursor"
-            || name_lower == ".vscode"
-            || name_lower == ".idea"
-            || name_lower == ".config"
-            || name_lower == ".anthropic"
-            || name_lower == ".ollama"
-        {
-            return false;
-        }
-
-        if name.starts_with('.') && name != "." {
-            return false;
-        }
-
-        if is_ignored_by_patterns(path, &ignore_patterns, &project_root) {
-            return false;
-        }
-
-        true
+        !fs_utils::should_skip_path(path, &ignore_patterns, &project_root)
     };
 
     for entry in WalkDir::new(&canonical_target)
@@ -1750,7 +1656,7 @@ async fn scan_directory(
                 continue;
             }
         };
-        let absolute_file_path = clean_path(&absolute_path);
+        let absolute_file_path = fs_utils::clean_path(&absolute_path);
 
         let source_code = match fs::read_to_string(path) {
             Ok(contents) => contents,
@@ -1812,7 +1718,7 @@ async fn scan_directory(
                 continue;
             };
 
-            let dest_path_cleaned = clean_path(&destination_path);
+            let dest_path_cleaned = fs_utils::clean_path(&destination_path);
             if let Err(error) = connection
                 .save_dependency_relation(&batch.origin_path, &dest_path_cleaned)
                 .await
@@ -1864,7 +1770,7 @@ async fn print_tree(
     depth: u32,
 ) -> anyhow::Result<()> {
     let absolute_path = canonicalize_file(file_path)?;
-    let absolute_path_text = clean_path(&absolute_path);
+    let absolute_path_text = fs_utils::clean_path(&absolute_path);
     let mut visited = HashSet::new();
 
     let tree = load_tree_node(connection, &absolute_path_text, depth, &mut visited).await?;
@@ -2036,7 +1942,7 @@ async fn print_trace(
     depth: u32,
 ) -> anyhow::Result<()> {
     let absolute_path = canonicalize_file(file_path)?;
-    let absolute_path_text = clean_path(&absolute_path);
+    let absolute_path_text = fs_utils::clean_path(&absolute_path);
     let mut visited = HashSet::new();
 
     let trace = load_trace_node(connection, &absolute_path_text, depth, &mut visited).await?;
@@ -2502,7 +2408,7 @@ async fn run_watch(context: &AppContext, target_path: &str, force: bool) -> anyh
                         }
                         if should_watch_path(&path, &ignore_patterns, &project_root) {
                             let absolute_path = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
-                            let absolute_file_path = clean_path(&absolute_path);
+                            let absolute_file_path = fs_utils::clean_path(&absolute_path);
                             if is_connected.load(Ordering::SeqCst) {
                                 eprintln!("[WATCHER] Re-indexando incrementalmente: {}", path.display());
                                 if let Err(e) = index_single_file(&context.connection, &path).await {
@@ -2525,7 +2431,7 @@ async fn run_watch(context: &AppContext, target_path: &str, force: bool) -> anyh
                         }
                         if should_process_delete(&path, &ignore_patterns, &project_root) {
                             let resolved = canonicalize_deleted_path(&path).unwrap_or_else(|| path.clone());
-                            let absolute_file_path = clean_path(&resolved);
+                            let absolute_file_path = fs_utils::clean_path(&resolved);
                             if is_connected.load(Ordering::SeqCst) {
                                 eprintln!("[WATCHER] Detectada eliminación de: {}. Limpiando grafo...", absolute_file_path);
                                 if let Err(e) = context.connection.delete_file_definition(&absolute_file_path).await {
@@ -2548,14 +2454,7 @@ async fn run_watch(context: &AppContext, target_path: &str, force: bool) -> anyh
     Ok(())
 }
 
-fn clean_path(path: &Path) -> String {
-    let s = path.to_string_lossy().to_string();
-    if s.starts_with(r"\\?\") {
-        s[4..].to_string()
-    } else {
-        s
-    }
-}
+
 
 fn canonicalize_deleted_path(path: &Path) -> Option<PathBuf> {
     let parent = path.parent()?;
@@ -2565,146 +2464,15 @@ fn canonicalize_deleted_path(path: &Path) -> Option<PathBuf> {
 }
 
 fn should_process_delete(path: &Path, ignore_patterns: &[String], project_root: &Path) -> bool {
-    if is_ignored_by_patterns(path, ignore_patterns, project_root) {
-        return false;
-    }
-    if is_binary_file(path) {
-        return false;
-    }
-    if is_garbage_file(path) {
-        return false;
-    }
-    let path_str_lower = path.to_string_lossy().to_lowercase();
-    for component in path.components() {
-        if let Some(name) = component.as_os_str().to_str() {
-            let name_lower = name.to_lowercase();
-
-            // Carpetas de Sistema
-            if name_lower == "appdata"
-                || name_lower == "program files"
-                || name_lower == "programdata"
-                || name_lower == "system32"
-                || name_lower == "windows"
-                || name_lower == ".git"
-                || name_lower == ".svn"
-            {
-                return false;
-            }
-
-            // Entornos de Desarrollo
-            if name_lower == "node_modules"
-                || name_lower == "__pycache__"
-                || name_lower == ".venv"
-                || name_lower == "env"
-                || name_lower == "target"
-                || name_lower == "dist"
-                || name_lower == "build"
-            {
-                return false;
-            }
-
-            // Navegadores y WebViews
-            if name_lower == "ebwebview"
-                || name_lower == "bravesoftware"
-                || path_str_lower.contains("google/chrome")
-                || path_str_lower.contains("google\\chrome")
-                || path_str_lower.contains("microsoft/edge")
-                || path_str_lower.contains("microsoft\\edge")
-                || name_lower == "cache"
-                || name_lower == "local storage"
-            {
-                return false;
-            }
-
-            // Herramientas de IA y Editores
-            if name_lower == ".cursor"
-                || name_lower == ".vscode"
-                || name_lower == ".idea"
-                || name_lower == ".config"
-                || name_lower == ".anthropic"
-                || name_lower == ".ollama"
-            {
-                return false;
-            }
-
-            if name.starts_with('.') && name != "." {
-                return false;
-            }
-        }
-    }
-    true
+    !fs_utils::should_skip_path(path, ignore_patterns, project_root)
 }
 
 fn should_watch_path(path: &Path, ignore_patterns: &[String], project_root: &Path) -> bool {
-    if is_ignored_by_patterns(path, ignore_patterns, project_root) {
+    if fs_utils::should_skip_path(path, ignore_patterns, project_root) {
         return false;
     }
     if !path.is_file() {
         return false;
-    }
-    if is_binary_file(path) {
-        return false;
-    }
-    if is_garbage_file(path) {
-        return false;
-    }
-    let path_str_lower = path.to_string_lossy().to_lowercase();
-    for component in path.components() {
-        if let Some(name) = component.as_os_str().to_str() {
-            let name_lower = name.to_lowercase();
-
-            // Carpetas de Sistema
-            if name_lower == "appdata"
-                || name_lower == "program files"
-                || name_lower == "programdata"
-                || name_lower == "system32"
-                || name_lower == "windows"
-                || name_lower == ".git"
-                || name_lower == ".svn"
-            {
-                return false;
-            }
-
-            // Entornos de Desarrollo
-            if name_lower == "node_modules"
-                || name_lower == "__pycache__"
-                || name_lower == ".venv"
-                || name_lower == "env"
-                || name_lower == "target"
-                || name_lower == "dist"
-                || name_lower == "build"
-            {
-                return false;
-            }
-
-            // Navegadores y WebViews
-            if name_lower == "ebwebview"
-                || name_lower == "bravesoftware"
-                || path_str_lower.contains("google/chrome")
-                || path_str_lower.contains("google\\chrome")
-                || path_str_lower.contains("microsoft/edge")
-                || path_str_lower.contains("microsoft\\edge")
-                || name_lower == "cache"
-                || name_lower == "local storage"
-            {
-                return false;
-            }
-
-            // Herramientas de IA y Editores
-            if name_lower == ".cursor"
-                || name_lower == ".vscode"
-                || name_lower == ".idea"
-                || name_lower == ".config"
-                || name_lower == ".anthropic"
-                || name_lower == ".ollama"
-            {
-                return false;
-            }
-
-            if name.starts_with('.') && name != "." {
-                return false;
-            }
-        }
     }
     true
 }
@@ -2712,7 +2480,7 @@ fn should_watch_path(path: &Path, ignore_patterns: &[String], project_root: &Pat
 async fn index_single_file(connection: &BackendClient, path: &Path) -> anyhow::Result<()> {
     let language = get_language_from_path(path);
     let absolute_path = fs::canonicalize(path)?;
-    let absolute_file_path = clean_path(&absolute_path);
+    let absolute_file_path = fs_utils::clean_path(&absolute_path);
 
     let source_code = match fs::read_to_string(path) {
         Ok(contents) => contents,
@@ -2735,7 +2503,7 @@ async fn index_single_file(connection: &BackendClient, path: &Path) -> anyhow::R
             let internal_hints: Vec<_> = hints.into_iter().filter(is_internal_dependency_hint).collect();
             for hint in internal_hints {
                 if let Some(destination_path) = resolve_dependency_target(&hint, &absolute_file_path) {
-                    let dest_path_cleaned = clean_path(&destination_path);
+                    let dest_path_cleaned = fs_utils::clean_path(&destination_path);
                     let _ = connection.save_dependency_relation(&absolute_file_path, &dest_path_cleaned).await;
                 }
             }
@@ -2751,10 +2519,10 @@ fn canonicalize_file(file_path: &str) -> anyhow::Result<PathBuf> {
 
 fn resolve_project_root(target_path: &Path) -> PathBuf {
     if let Ok((_, config)) = load_config() {
-        let clean_target_lower = clean_path(target_path).to_lowercase();
+        let clean_target_lower = fs_utils::clean_path(target_path).to_lowercase();
         for (_, registered_path_str) in &config.projects {
             if let Ok(reg_path_buf) = PathBuf::from(registered_path_str).canonicalize() {
-                let clean_reg_path_lower = clean_path(&reg_path_buf).to_lowercase();
+                let clean_reg_path_lower = fs_utils::clean_path(&reg_path_buf).to_lowercase();
                 if clean_target_lower == clean_reg_path_lower 
                     || clean_target_lower.starts_with(&format!("{}\\", clean_reg_path_lower)) 
                     || clean_target_lower.starts_with(&format!("{}/", clean_reg_path_lower)) 
@@ -2796,39 +2564,7 @@ fn load_ignore_patterns_for_project(project_root: &Path) -> Vec<String> {
 }
 
 fn is_ignored_by_patterns(path: &Path, patterns: &[String], project_root: &Path) -> bool {
-    if patterns.is_empty() {
-        return false;
-    }
-    let cleaned_path_str = clean_path(path);
-    let cleaned_path = Path::new(&cleaned_path_str);
-
-    let relative_path = if let Ok(rel) = cleaned_path.strip_prefix(project_root) {
-        rel.to_path_buf()
-    } else {
-        cleaned_path.to_path_buf()
-    };
-
-    let rel_str = relative_path.to_string_lossy().replace('\\', "/");
-    let rel_str_lower = rel_str.to_lowercase();
-
-    for pattern in patterns {
-        let pattern_lower = pattern.to_lowercase().replace('\\', "/");
-        if rel_str_lower == pattern_lower {
-            return true;
-        }
-        let prefix_dir = format!("{}/", pattern_lower);
-        if rel_str_lower.starts_with(&prefix_dir) {
-            return true;
-        }
-        for component in relative_path.components() {
-            if let Some(comp_str) = component.as_os_str().to_str() {
-                if comp_str.to_lowercase() == pattern_lower {
-                    return true;
-                }
-            }
-        }
-    }
-    false
+    fs_utils::is_ignored_by_patterns(path, patterns, project_root)
 }
 
 async fn run_ignore() -> anyhow::Result<()> {
@@ -2890,10 +2626,14 @@ struct RustDependencyBatch {
 
 fn is_critical_root(path: &Path) -> bool {
     let mut components = path.components();
-    let _first = components.next();
-    let second = components.next();
-    if second.is_none() || (second.is_some() && components.next().is_none() && matches!(second.unwrap(), std::path::Component::RootDir)) {
-        return true;
+    components.next(); // skip root or first component
+    match components.next() {
+        None => return true,
+        Some(comp) => {
+            if matches!(comp, std::path::Component::RootDir) && components.next().is_none() {
+                return true;
+            }
+        }
     }
     let path_str = path.to_string_lossy().to_lowercase();
     let path_cleaned = path_str.trim_end_matches('\\').trim_end_matches('/');
@@ -2914,15 +2654,7 @@ fn is_critical_root(path: &Path) -> bool {
 }
 
 fn is_garbage_file(path: &Path) -> bool {
-    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-        let ext_lower = ext.to_lowercase();
-        match ext_lower.as_str() {
-            "log" | "history" | "bin" | "dat" | "cache" | "exe" | "dll" | "so" | "dylib" | "db" | "sqlite" | "sqlite3" | "pstat" | "lock" | "pid" => true,
-            _ => false,
-        }
-    } else {
-        false
-    }
+    fs_utils::is_garbage_file(path)
 }
 
 fn run_start(path_arg: Option<String>, force: bool) -> anyhow::Result<()> {
@@ -2986,7 +2718,7 @@ fn run_start(path_arg: Option<String>, force: bool) -> anyhow::Result<()> {
 
 fn check_directory_authorized(target_path: &str) -> anyhow::Result<()> {
     let canonical_target = canonicalize_target(target_path)?;
-    let clean_target = clean_path(&canonical_target);
+    let clean_target = fs_utils::clean_path(&canonical_target);
     let clean_target_lower = clean_target.to_lowercase();
     
     let (_, config) = load_config()?;
@@ -2994,7 +2726,7 @@ fn check_directory_authorized(target_path: &str) -> anyhow::Result<()> {
     let mut is_authorized = false;
     for (_, registered_path_str) in &config.projects {
         if let Ok(reg_path_buf) = PathBuf::from(registered_path_str).canonicalize() {
-            let clean_reg_path_lower = clean_path(&reg_path_buf).to_lowercase();
+            let clean_reg_path_lower = fs_utils::clean_path(&reg_path_buf).to_lowercase();
             if clean_target_lower == clean_reg_path_lower {
                 is_authorized = true;
                 break;
@@ -3015,7 +2747,7 @@ fn run_register(name_arg: Option<String>) -> anyhow::Result<()> {
     let current_dir = std::env::current_dir()?;
     let canonical_path = current_dir.canonicalize()
         .context("Failed to canonicalize current directory path")?;
-    let cleaned_path = clean_path(&canonical_path);
+    let cleaned_path = fs_utils::clean_path(&canonical_path);
 
     let name = match name_arg {
         Some(n) => n,
@@ -3046,11 +2778,11 @@ async fn run_deregister(name_arg: Option<String>) -> anyhow::Result<()> {
         Some(p) => p,
         None => {
             let current_dir = std::env::current_dir()?;
-            let cleaned_curr = clean_path(&current_dir.canonicalize()?);
+            let cleaned_curr = fs_utils::clean_path(&current_dir.canonicalize()?);
             let mut found_name = None;
             for (name, registered_path_str) in &config.projects {
                 if let Ok(reg_path_buf) = PathBuf::from(registered_path_str).canonicalize() {
-                    if clean_path(&reg_path_buf) == cleaned_curr {
+                    if fs_utils::clean_path(&reg_path_buf) == cleaned_curr {
                         found_name = Some(name.clone());
                         break;
                     }
@@ -3183,12 +2915,12 @@ fn run_stop(project_arg: Option<String>) -> anyhow::Result<()> {
         Some(p) => p,
         None => {
             let current_dir = std::env::current_dir()?;
-            let cleaned_curr = clean_path(&current_dir.canonicalize()?);
+            let cleaned_curr = fs_utils::clean_path(&current_dir.canonicalize()?);
             let mut found_name = None;
             if let Ok((_, config)) = load_config() {
                 for (name, registered_path_str) in &config.projects {
                     if let Ok(reg_path_buf) = PathBuf::from(registered_path_str).canonicalize() {
-                        if clean_path(&reg_path_buf) == cleaned_curr {
+                        if fs_utils::clean_path(&reg_path_buf) == cleaned_curr {
                             found_name = Some(name.clone());
                             break;
                         }
@@ -3237,12 +2969,12 @@ async fn run_logs_tail(project_arg: Option<String>) -> anyhow::Result<()> {
         Some(p) => p,
         None => {
             let current_dir = std::env::current_dir()?;
-            let cleaned_curr = clean_path(&current_dir.canonicalize()?);
+            let cleaned_curr = fs_utils::clean_path(&current_dir.canonicalize()?);
             let mut found_name = "global".to_string();
             if let Ok((_, config)) = load_config() {
                 for (name, registered_path_str) in &config.projects {
                     if let Ok(reg_path_buf) = PathBuf::from(registered_path_str).canonicalize() {
-                        if clean_path(&reg_path_buf) == cleaned_curr {
+                        if fs_utils::clean_path(&reg_path_buf) == cleaned_curr {
                             found_name = name.clone();
                             break;
                         }
@@ -3446,13 +3178,13 @@ mod tests {
 
 fn get_project_identifier(target_path: &str) -> anyhow::Result<(String, String)> {
     let canonical = canonicalize_target(target_path)?;
-    let clean_target = clean_path(&canonical);
+    let clean_target = fs_utils::clean_path(&canonical);
     let clean_target_lower = clean_target.to_lowercase();
     
     let (_, config) = load_config()?;
     for (name, registered_path_str) in &config.projects {
         if let Ok(reg_path_buf) = PathBuf::from(registered_path_str).canonicalize() {
-            let clean_reg_path_lower = clean_path(&reg_path_buf).to_lowercase();
+            let clean_reg_path_lower = fs_utils::clean_path(&reg_path_buf).to_lowercase();
             if clean_target_lower == clean_reg_path_lower {
                 return Ok((name.clone(), clean_target));
             }
@@ -3540,202 +3272,21 @@ fn shorten_path(path_str: &str, max_len: usize) -> String {
 }
 
 async fn run_mcp_setup() -> anyhow::Result<()> {
-    let home_dir = home::home_dir().context("No se pudo determinar el directorio home.")?;
+    let token = std::env::var("OZYBASE_MCP_TOKEN")
+        .ok()
+        .or_else(|| load_config().ok().and_then(|(_, cfg)| cfg.token))
+        .unwrap_or_else(|| String::new());
 
-    let cursor_path = if cfg!(target_os = "windows") {
-        let appdata = std::env::var("APPDATA")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| home_dir.join("AppData").join("Roaming"));
-        appdata.join("Cursor").join("User").join("globalStorage").join("saoudrizwan.claude-dev").join("settings").join("mcp_config.json")
-    } else if cfg!(target_os = "macos") {
-        home_dir.join("Library").join("Application Support").join("Cursor").join("User").join("globalStorage").join("saoudrizwan.claude-dev").join("settings").join("mcp_config.json")
-    } else {
-        home_dir.join(".config").join("Cursor").join("User").join("globalStorage").join("saoudrizwan.claude-dev").join("settings").join("mcp_config.json")
-    };
+    let ozymem_cmd = resolve_ozymem_binary(&home::home_dir().context("No se pudo determinar el directorio home.")?);
+    let mcp_value = serde_json::json!({
+        "command": ozymem_cmd,
+        "args": ["mcp", "run"],
+        "env": { "OZYBASE_MCP_TOKEN": token }
+    });
 
-    let claude_path = if cfg!(target_os = "windows") {
-        let appdata = std::env::var("APPDATA")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| home_dir.join("AppData").join("Roaming"));
-        appdata.join("Claude").join("claude_desktop_config.json")
-    } else if cfg!(target_os = "macos") {
-        home_dir.join("Library").join("Application Support").join("Claude").join("claude_desktop_config.json")
-    } else {
-        home_dir.join(".config").join("Claude").join("claude_desktop_config.json")
-    };
-
-    struct McpTarget {
-        name: &'static str,
-        path: PathBuf,
-    }
-
-    let targets = vec![
-        McpTarget {
-            name: "VS Code (Antigravity / Claude Dev)",
-            path: home_dir.join(".gemini").join("antigravity").join("mcp_config.json"),
-        },
-        McpTarget {
-            name: "Cursor Editor",
-            path: cursor_path.clone(),
-        },
-        McpTarget {
-            name: "Claude Desktop",
-            path: claude_path.clone(),
-        },
-    ];
-
-    let mut detected = Vec::new();
-    for target in targets {
-        if target.path.exists() {
-            detected.push(target);
-        }
-    }
-
-    let selected_target = if detected.is_empty() {
-        println!("No se detecto ningun archivo de configuracion MCP activo en las rutas conocidas.");
-        println!("Desea inicializar uno nuevo en alguna de estas rutas?");
-        println!("1) VS Code (Antigravity / Claude Dev)");
-        println!("2) Cursor Editor");
-        println!("3) Claude Desktop");
-        print!("Seleccione una opcion (o presione Enter para salir): ");
-        use std::io::Write;
-        std::io::stdout().flush()?;
-        
-        let mut choice_str = String::new();
-        std::io::stdin().read_line(&mut choice_str)?;
-        let choice = choice_str.trim().parse::<usize>().ok();
-        
-        let targets_all = vec![
-            McpTarget {
-                name: "VS Code (Antigravity / Claude Dev)",
-                path: home_dir.join(".gemini").join("antigravity").join("mcp_config.json"),
-            },
-            McpTarget {
-                name: "Cursor Editor",
-                path: cursor_path,
-            },
-            McpTarget {
-                name: "Claude Desktop",
-                path: claude_path,
-            },
-        ];
-        
-        match choice {
-            Some(1) => targets_all.into_iter().nth(0),
-            Some(2) => targets_all.into_iter().nth(1),
-            Some(3) => targets_all.into_iter().nth(2),
-            _ => {
-                println!("Operacion cancelada.");
-                return Ok(());
-            }
-        }
-    } else if detected.len() == 1 {
-        let target = detected.remove(0);
-        print!("Se detecto un unico entorno configurable: {} [{}]\n¿Desea configurar este entorno? (y/n): ", target.name, target.path.display());
-        use std::io::Write;
-        std::io::stdout().flush()?;
-        let mut confirm_str = String::new();
-        std::io::stdin().read_line(&mut confirm_str)?;
-        if confirm_str.trim().to_lowercase().starts_with('y') {
-            Some(target)
-        } else {
-            println!("Operacion cancelada.");
-            return Ok(());
-        }
-    } else {
-        println!("Se detectaron multiples entornos MCP configurables:");
-        for (i, target) in detected.iter().enumerate() {
-            println!("{}) {} [{}]", i + 1, target.name, target.path.display());
-        }
-        print!("Seleccione el numero del entorno que desea configurar: ");
-        use std::io::Write;
-        std::io::stdout().flush()?;
-        
-        let mut choice_str = String::new();
-        std::io::stdin().read_line(&mut choice_str)?;
-        let choice = choice_str.trim().parse::<usize>().ok();
-        match choice {
-            Some(idx) if idx > 0 && idx <= detected.len() => {
-                Some(detected.remove(idx - 1))
-            }
-            _ => {
-                println!("Seleccion invalida. Operacion cancelada.");
-                return Ok(());
-            }
-        }
-    };
-
-    if let Some(target) = selected_target {
-        let path = target.path;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        
-        let content = if path.exists() {
-            std::fs::read_to_string(&path).unwrap_or_default()
-        } else {
-            String::new()
-        };
-
-        let mut json_val: serde_json::Value = if content.trim().is_empty() {
-            serde_json::json!({
-                "mcpServers": {}
-            })
-        } else {
-            serde_json::from_str(&content).unwrap_or_else(|_| {
-                serde_json::json!({
-                    "mcpServers": {}
-                })
-            })
-        };
-
-        let ozymem_path = home_dir.join(".cargo").join("bin").join(if cfg!(windows) { "ozymem.exe" } else { "ozymem" });
-        let ozymem_cmd = if ozymem_path.exists() {
-            ozymem_path.to_string_lossy().to_string()
-        } else {
-            "ozymem".to_string()
-        };
-
-        let token = std::env::var("OZYBASE_MCP_TOKEN")
-            .ok()
-            .or_else(|| {
-                load_config().ok().and_then(|(_, cfg)| cfg.token)
-            })
-            .unwrap_or_else(|| "ozys_8f7e_8f7e50d578a699177eba16c7".to_string());
-
-        if let Some(mcp_servers) = json_val.get_mut("mcpServers") {
-            if let Some(mcp_servers_obj) = mcp_servers.as_object_mut() {
-                mcp_servers_obj.insert(
-                    "ozybase".to_string(),
-                    serde_json::json!({
-                        "command": ozymem_cmd,
-                        "args": ["mcp", "run"],
-                        "env": {
-                            "OZYBASE_MCP_TOKEN": token
-                        }
-                    })
-                );
-            }
-        } else {
-            if let Some(obj) = json_val.as_object_mut() {
-                obj.insert(
-                    "mcpServers".to_string(),
-                    serde_json::json!({
-                        "ozybase": {
-                            "command": ozymem_cmd,
-                            "args": ["mcp", "run"],
-                            "env": {
-                                "OZYBASE_MCP_TOKEN": token
-                            }
-                        }
-                    })
-                );
-            }
-        }
-
-        let pretty_json = serde_json::to_string_pretty(&json_val)?;
-        std::fs::write(&path, pretty_json)?;
-        println!("[SUCCESS] Configuracion inyectada con exito en: {}", path.display());
+    if let Some(target) = select_mcp_target(mcp_targets())? {
+        write_mcp_server_config(&target.path, "ozybase", &mcp_value)?;
+        println!("[SUCCESS] Configuracion inyectada con exito en: {}", target.path.display());
     }
 
     Ok(())
@@ -4151,7 +3702,7 @@ async fn run_auth_reset_token() -> anyhow::Result<()> {
     }
 
     let (config_path, mut config) = load_config()?;
-    let current_token = config.token.clone().unwrap_or_else(|| "ozys_8f7e_8f7e50d578a699177eba16c7".to_string());
+    let current_token = config.token.clone().unwrap_or_else(|| String::new());
     
     let server_uuid = if current_token.starts_with("ozy_partner_ctx_") && current_token.contains("_usr_") {
         let trimmed = &current_token["ozy_partner_ctx_".len()..];
