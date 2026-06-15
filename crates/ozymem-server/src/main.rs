@@ -10,7 +10,7 @@ use axum::{
     extract::{Query, State},
     http::{HeaderMap, StatusCode},
     middleware::{self, Next},
-    response::Response,
+    response::{Html, Response},
     routing::{get, post},
     Json, Router,
 };
@@ -485,6 +485,7 @@ async fn run_web_server(connection_cell: Arc<OnceCell<MemgraphConnection>>) -> a
     let body_limit = tower_http::limit::RequestBodyLimitLayer::new(10 * 1024 * 1024);
     
     let public_routes = Router::new()
+        .route("/", get(handle_dashboard))
         .route("/api/ping", get(handle_ping))
         .route("/api/health", get(handle_health));
 
@@ -542,6 +543,10 @@ async fn handle_health(
 
 async fn handle_ping() -> Result<Json<Value>, StatusCode> {
     Ok(Json(json!({ "status": "pong" })))
+}
+
+async fn handle_dashboard() -> Html<&'static str> {
+    Html(DASHBOARD_HTML)
 }
 
 async fn handle_clear(
@@ -859,3 +864,200 @@ async fn handle_gpr_merge(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(StatusCode::OK)
 }
+
+const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ozymem Partner - Memgraph Dashboard</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0a0a0f;color:#e0e0e0;min-height:100vh}
+.header{background:linear-gradient(135deg,#1a1a2e,#16213e);padding:24px 32px;border-bottom:1px solid #2a2a4a}
+.header h1{font-size:24px;color:#fff;margin-bottom:4px}
+.header p{color:#8888aa;font-size:14px}
+.container{max-width:1200px;margin:0 auto;padding:24px 32px}
+.status-bar{display:flex;gap:16px;margin-bottom:24px;flex-wrap:wrap}
+.status-card{flex:1;min-width:200px;background:#12121f;border:1px solid #2a2a4a;border-radius:12px;padding:20px}
+.status-card h3{font-size:12px;text-transform:uppercase;color:#6666aa;margin-bottom:8px}
+.status-card .value{font-size:28px;font-weight:700}
+.status-card .value.ok{color:#4ade80}
+.status-card .value.warn{color:#fbbf24}
+.status-card .value.err{color:#f87171}
+.section{background:#12121f;border:1px solid #2a2a4a;border-radius:12px;padding:24px;margin-bottom:24px}
+.section h2{font-size:18px;color:#fff;margin-bottom:16px;display:flex;align-items:center;gap:8px}
+.section h2::before{content:'';width:4px;height:20px;background:#6366f1;border-radius:2px}
+table{width:100%;border-collapse:collapse}
+th{text-align:left;padding:10px 12px;border-bottom:1px solid #2a2a4a;color:#8888aa;font-size:12px;text-transform:uppercase}
+td{padding:10px 12px;border-bottom:1px solid #1a1a2e;font-size:14px}
+td.method{font-weight:600;font-family:monospace}
+td.method.get{color:#4ade80}
+td.method.post{color:#fbbf24}
+#graph-container{width:100%;height:500px;background:#0a0a0f;border-radius:8px;border:1px solid #2a2a4a;position:relative}
+#graph-canvas{width:100%;height:100%}
+.legend{display:flex;gap:16px;margin-top:12px;flex-wrap:wrap}
+.legend-item{display:flex;align-items:center;gap:6px;font-size:12px;color:#8888aa}
+.legend-dot{width:10px;height:10px;border-radius:50%}
+.btn{background:#6366f1;color:#fff;border:none;padding:10px 20px;border-radius:8px;cursor:pointer;font-size:14px;font-weight:600}
+.btn:hover{background:#5558e6}
+.btn:disabled{opacity:0.5;cursor:not-allowed}
+.graph-empty{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);text-align:center;color:#555}
+.graph-empty p{margin-top:8px;font-size:14px}
+.loader{display:inline-block;width:16px;height:16px;border:2px solid #333;border-top-color:#6366f1;border-radius:50%;animation:spin .6s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.footer{text-align:center;padding:24px;color:#444;font-size:12px}
+</style>
+</head>
+<body>
+<div class="header">
+<h1>Ozymem Partner</h1>
+<p>Memgraph Knowledge Graph Dashboard</p>
+</div>
+<div class="container">
+<div class="status-bar">
+<div class="status-card">
+<h3>Server Status</h3>
+<div class="value" id="server-status">...</div>
+</div>
+<div class="status-card">
+<h3>Memgraph</h3>
+<div class="value" id="memgraph-status">...</div>
+</div>
+<div class="status-card">
+<h3>Total Nodes</h3>
+<div class="value" id="total-nodes">...</div>
+</div>
+<div class="status-card">
+<h3>Total Edges</h3>
+<div class="value" id="total-edges">...</div>
+</div>
+</div>
+
+<div class="section">
+<h2>Graph Visualization</h2>
+<button class="btn" id="load-graph" onclick="loadGraph()">Load Graph</button>
+<div id="graph-container">
+<canvas id="graph-canvas"></canvas>
+<div class="graph-empty" id="graph-empty">
+<div style="font-size:48px">&#x1F4CA;</div>
+<p>Click "Load Graph" to visualize your knowledge graph</p>
+</div>
+</div>
+<div class="legend">
+<div class="legend-item"><div class="legend-dot" style="background:#6366f1"></div>File</div>
+<div class="legend-item"><div class="legend-dot" style="background:#4ade80"></div>Function</div>
+<div class="legend-item"><div class="legend-dot" style="background:#fbbf24"></div>Class</div>
+<div class="legend-item"><div class="legend-dot" style="background:#f87171"></div>Module</div>
+<div class="legend-item"><div class="legend-dot" style="background:#818cf8"></div>Import</div>
+</div>
+</div>
+
+<div class="section">
+<h2>API Endpoints</h2>
+<table>
+<thead><tr><th>Method</th><th>Endpoint</th><th>Description</th><th>Auth</th></tr></thead>
+<tbody>
+<tr><td class="method get">GET</td><td>/api/ping</td><td>Health check (no auth)</td><td>No</td></tr>
+<tr><td class="method get">GET</td><td>/api/health</td><td>Deep health with Memgraph ping</td><td>No</td></tr>
+<tr><td class="method get">GET</td><td>/api/graph-summary</td><td>Graph statistics</td><td>Yes</td></tr>
+<tr><td class="method get">GET</td><td>/api/files</td><td>List all file paths</td><td>Yes</td></tr>
+<tr><td class="method get">GET</td><td>/api/file-context?file_path=</td><td>File graph context</td><td>Yes</td></tr>
+<tr><td class="method get">GET</td><td>/api/outgoing-dependencies?file_path=</td><td>Outgoing dependencies</td><td>Yes</td></tr>
+<tr><td class="method get">GET</td><td>/api/incoming-dependencies?file_path=</td><td>Incoming dependencies</td><td>Yes</td></tr>
+<tr><td class="method get">GET</td><td>/api/lessons?limit=10</td><td>Recent lessons learned</td><td>Yes</td></tr>
+<tr><td class="method get">GET</td><td>/api/historical-engrams?file_path=</td><td>Historical solutions</td><td>Yes</td></tr>
+<tr><td class="method get">GET</td><td>/api/find-symbol?symbol_name=&project_path=</td><td>Find symbol location</td><td>Yes</td></tr>
+<tr><td class="method post">POST</td><td>/api/file-definition</td><td>Save file definition</td><td>Yes</td></tr>
+<tr><td class="method post">POST</td><td>/api/dependency-relation</td><td>Save dependency</td><td>Yes</td></tr>
+<tr><td class="method post">POST</td><td>/api/lesson</td><td>Record lesson</td><td>Yes</td></tr>
+<tr><td class="method post">POST</td><td>/api/clear</td><td>Clear graph (Lead only)</td><td>Yes</td></tr>
+<tr><td class="method post">POST</td><td>/api/team/create</td><td>Create user (Lead only)</td><td>Yes</td></tr>
+</tbody>
+</table>
+</div>
+</div>
+<div class="footer">Ozymem Partner v0.1.0 &mdash; Knowledge Graph Backend for Collaborative Development</div>
+
+<script>
+async function checkStatus() {
+  try {
+    const r = await fetch('/api/ping');
+    if (r.ok) { document.getElementById('server-status').textContent = 'Online'; document.getElementById('server-status').className = 'value ok'; }
+    else { document.getElementById('server-status').textContent = 'Error'; document.getElementById('server-status').className = 'value err'; }
+  } catch { document.getElementById('server-status').textContent = 'Offline'; document.getElementById('server-status').className = 'value err'; }
+}
+
+async function loadGraph() {
+  const btn = document.getElementById('load-graph');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="loader"></span> Loading...';
+  document.getElementById('graph-empty').style.display = 'none';
+  try {
+    const token = prompt('Enter your auth token (ozy_partner_ctx_..._usr_...):');
+    if (!token) { btn.disabled = false; btn.textContent = 'Load Graph'; return; }
+    const r = await fetch('/api/graph-summary', { headers: { 'Authorization': 'Bearer ' + token } });
+    if (!r.ok) throw new Error('API returned ' + r.status);
+    const data = await r.json();
+    document.getElementById('total-nodes').textContent = data.total_files || 0;
+    document.getElementById('total-nodes').className = 'value ok';
+    document.getElementById('total-edges').textContent = data.total_dependencies || 0;
+    document.getElementById('total-edges').className = 'value ok';
+    document.getElementById('memgraph-status').textContent = 'Connected';
+    document.getElementById('memgraph-status').className = 'value ok';
+    drawGraph(data);
+  } catch(e) {
+    document.getElementById('memgraph-status').textContent = 'Error';
+    document.getElementById('memgraph-status').className = 'value err';
+    document.getElementById('graph-empty').style.display = '';
+    document.getElementById('graph-empty').querySelector('p').textContent = 'Error: ' + e.message;
+  }
+  btn.disabled = false;
+  btn.textContent = 'Load Graph';
+}
+
+function drawGraph(data) {
+  const canvas = document.getElementById('graph-canvas');
+  const ctx = canvas.getContext('2d');
+  const container = document.getElementById('graph-container');
+  canvas.width = container.clientWidth;
+  canvas.height = container.clientHeight;
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  const files = data.files || data.file_names || [];
+  const deps = data.dependencies || [];
+  if (files.length === 0) {
+    document.getElementById('graph-empty').style.display = '';
+    document.getElementById('graph-empty').querySelector('p').textContent = 'No data in the graph yet. Use the API to add file definitions.';
+    return;
+  }
+  const nodes = files.map((f, i) => {
+    const angle = (2 * Math.PI * i) / files.length;
+    const r = Math.min(canvas.width, canvas.height) * 0.35;
+    const name = typeof f === 'string' ? f.split('/').pop() : (f.name || f.path?.split('/').pop() || 'Node ' + i);
+    const path = typeof f === 'string' ? f : (f.path || f.name || i);
+    return { name, path, x: canvas.width/2 + r * Math.cos(angle), y: canvas.height/2 + r * Math.sin(angle) };
+  });
+  const nodeMap = {};
+  nodes.forEach((n, i) => { nodeMap[n.path] = i; nodeMap[n.name] = i; });
+  ctx.strokeStyle = '#2a2a4a';
+  ctx.lineWidth = 1;
+  deps.forEach(d => {
+    const from = nodeMap[d.from || d.origin_path];
+    const to = nodeMap[d.to || d.destination_path];
+    if (from !== undefined && to !== undefined) {
+      ctx.beginPath(); ctx.moveTo(nodes[from].x, nodes[from].y); ctx.lineTo(nodes[to].x, nodes[to].y); ctx.stroke();
+    }
+  });
+  const colors = ['#6366f1','#4ade80','#fbbf24','#f87171','#818cf8','#a78bfa'];
+  nodes.forEach((n, i) => {
+    ctx.beginPath(); ctx.arc(n.x, n.y, 6, 0, Math.PI * 2);
+    ctx.fillStyle = colors[i % colors.length]; ctx.fill();
+    ctx.strokeStyle = '#0a0a0f'; ctx.lineWidth = 2; ctx.stroke();
+    ctx.fillStyle = '#ccc'; ctx.font = '11px sans-serif'; ctx.textAlign = 'center';
+    ctx.fillText(n.name.length > 20 ? n.name.slice(0,18)+'...' : n.name, n.x, n.y + 18);
+  });
+}
+checkStatus();
+</script>
+</body>
+</html>"#;
