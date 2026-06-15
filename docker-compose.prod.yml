@@ -8,8 +8,8 @@ services:
     volumes:
       - memgraph-data:/var/lib/memgraph
     environment:
-      - MEMGRAPH_USER=${MEMGRAPH_USER}
-      - MEMGRAPH_PASSWORD=${MEMGRAPH_PASSWORD}
+      MEMGRAPH_USER: ${MEMGRAPH_USER}
+      MEMGRAPH_PASSWORD: ${MEMGRAPH_PASSWORD}
     healthcheck:
       test: ["CMD-SHELL", "echo 'RETURN 1;' | mg_console --host localhost --port 7687 || exit 0"]
       interval: 10s
@@ -34,8 +34,9 @@ services:
     ports:
       - "7474:3000"
     environment:
+      PORT: "3000"
       QUICK_CONNECT_MG_HOST: memgraph
-      QUICK_CONNECT_MG_PORT: 7687
+      QUICK_CONNECT_MG_PORT: "7687"
     deploy:
       resources:
         limits:
@@ -56,12 +57,12 @@ services:
     ports:
       - "5857:5857"
     environment:
-      - MEMGRAPH_URI=memgraph:7687
-      - MEMGRAPH_USER=${MEMGRAPH_USER}
-      - MEMGRAPH_PASSWORD=${MEMGRAPH_PASSWORD}
-      - MEMGRAPH_DATABASE=${MEMGRAPH_DATABASE:-memgraph}
-      - PORT=5857
-      - OZYMEM_SERVER_MODE=web
+      PORT: "5857"
+      MEMGRAPH_URI: "memgraph:7687"
+      MEMGRAPH_USER: ${MEMGRAPH_USER}
+      MEMGRAPH_PASSWORD: ${MEMGRAPH_PASSWORD}
+      MEMGRAPH_DATABASE: ${MEMGRAPH_DATABASE:-memgraph}
+      OZYMEM_SERVER_MODE: "web"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:5857/api/ping"]
       interval: 30s
