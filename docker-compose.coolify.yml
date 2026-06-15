@@ -1,34 +1,89 @@
 # Coolify Docker Compose
-# For use with Coolify or similar container orchestration platforms
-# Memgraph should be deployed as a separate service/container
-
-version: '3.8'
+# Deploys: Memgraph + Memgraph Lab + Ozymem Server
 
 services:
+  memgraph:
+    image: memgraph/memgraph:latest
+    container_name: ozymem-memgraph
+    restart: always
+    ports:
+      - "7687:7687"
+    volumes:
+      - memgraph-data:/var/lib/memgraph
+    environment:
+      - MEMGRAPH_USER=${MEMGRAPH_USER}
+      - MEMGRAPH_PASSWORD=${MEMGRAPH_PASSWORD}
+    healthcheck:
+      test: ["CMD-SHELL", "echo 'RETURN 1;' | mg_console --host localhost --port 7687 || exit 0"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: '2'
+    networks:
+      - ozymem-network
+
+  memgraph-lab:
+    image: memgraph/lab:latest
+    container_name: ozymem-memgraph-lab
+    restart: always
+    depends_on:
+      memgraph:
+        condition: service_healthy
+    ports:
+      - "7474:3000"
+    environment:
+      QUICK_CONNECT_MG_HOST: memgraph
+      QUICK_CONNECT_MG_PORT: 7687
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '0.5'
+    networks:
+      - ozymem-network
+
   server:
     build:
       context: .
       dockerfile: Dockerfile
     container_name: ozymem-server
     restart: always
+    depends_on:
+      memgraph:
+        condition: service_healthy
     ports:
       - "8080:8080"
     environment:
-      # Required: Set these in Coolify environment variables
-      - MEMGRAPH_URI=${MEMGRAPH_URI:-memgraph:7687}
+      - MEMGRAPH_URI=memgraph:7687
       - MEMGRAPH_USER=${MEMGRAPH_USER}
       - MEMGRAPH_PASSWORD=${MEMGRAPH_PASSWORD}
       - MEMGRAPH_DATABASE=${MEMGRAPH_DATABASE:-memgraph}
       - PORT=8080
       - OZYMEM_SERVER_MODE=web
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/api/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:8080/api/ping"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 15s
+      start_period: 30s
     deploy:
       resources:
         limits:
           memory: 1G
           cpus: '1'
+    networks:
+      - ozymem-network
+
+volumes:
+  memgraph-data:
+    driver: local
+
+networks:
+  ozymem-network:
+    driver: bridge
+    internal: false
