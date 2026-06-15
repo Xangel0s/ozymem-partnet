@@ -57,7 +57,7 @@ WORKDIR /app
 COPY --from=real-builder /app/target/release/ozymem-server .
 
 # Verify binary exists and is executable
-RUN ls -la /app/ozymem-server && file /app/ozymem-server
+RUN ls -la /app/ozymem-server
 
 # Set ownership
 RUN chown -R ozymem:ozymem /app
