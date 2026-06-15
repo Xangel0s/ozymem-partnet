@@ -1,0 +1,34 @@
+# Coolify Docker Compose
+# For use with Coolify or similar container orchestration platforms
+# Memgraph should be deployed as a separate service/container
+
+version: '3.8'
+
+services:
+  server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ozymem-server
+    restart: always
+    ports:
+      - "8080:8080"
+    environment:
+      # Required: Set these in Coolify environment variables
+      - MEMGRAPH_URI=${MEMGRAPH_URI:-memgraph:7687}
+      - MEMGRAPH_USER=${MEMGRAPH_USER}
+      - MEMGRAPH_PASSWORD=${MEMGRAPH_PASSWORD}
+      - MEMGRAPH_DATABASE=${MEMGRAPH_DATABASE:-memgraph}
+      - PORT=8080
+      - OZYMEM_SERVER_MODE=web
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: '1'

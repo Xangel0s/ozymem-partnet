@@ -1,5 +1,5 @@
 # Development Docker Compose
-# For production, use docker-compose.prod.yml
+# For production, use docker-compose.prod.yml or docker-compose.coolify.yml
 # Make sure to set MEMGRAPH_USER and MEMGRAPH_PASSWORD in .env file
 
 services:
@@ -7,7 +7,7 @@ services:
     image: memgraph/memgraph:latest
     container_name: ozymem-memgraph
     ports:
-      - "127.0.0.1:7687:7687"
+      - "7687:7687"
     volumes:
       - memgraph-data:/var/lib/memgraph
     environment:
@@ -27,7 +27,7 @@ services:
       memgraph:
         condition: service_healthy
     ports:
-      - "127.0.0.1:3000:3000"
+      - "3000:3000"
     environment:
       QUICK_CONNECT_MG_HOST: memgraph
       QUICK_CONNECT_MG_PORT: 7687

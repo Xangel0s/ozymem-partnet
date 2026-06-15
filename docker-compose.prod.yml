@@ -6,7 +6,7 @@ services:
     container_name: ozymem-memgraph
     restart: always
     ports:
-      - "127.0.0.1:7687:7687"
+      - "7687:7687"
     volumes:
       - memgraph-data:/var/lib/memgraph
     environment:
@@ -34,7 +34,7 @@ services:
       memgraph:
         condition: service_healthy
     ports:
-      - "127.0.0.1:3000:3000"
+      - "3000:3000"
     environment:
       QUICK_CONNECT_MG_HOST: memgraph
       QUICK_CONNECT_MG_PORT: 7687
@@ -56,7 +56,7 @@ services:
       memgraph:
         condition: service_healthy
     ports:
-      - "127.0.0.1:8080:8080"
+      - "8080:8080"
     environment:
       - MEMGRAPH_URI=memgraph:7687
       - MEMGRAPH_USER=${MEMGRAPH_USER}

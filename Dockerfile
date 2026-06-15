@@ -1,4 +1,6 @@
 # Multi-stage Dockerfile for ozymem-server
+# Compatible with Coolify, Docker, and docker-compose
+
 # Stage 1: Builder with dependency caching
 FROM rust:1.75-slim as builder
 
@@ -40,10 +42,11 @@ RUN rm -f crates/ozymem-core/src/lib.rs crates/ozymem-parser/src/lib.rs crates/o
 # Stage 3: Runtime
 FROM debian:bookworm-slim
 
-# Install runtime dependencies
+# Install runtime dependencies including curl for healthcheck
 RUN apt-get update && apt-get install -y \
     ca-certificates \
     libssl3 \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 # Create non-root user for security
@@ -68,7 +71,7 @@ ENV MEMGRAPH_DATABASE=memgraph
 EXPOSE 8080
 
 # Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
     CMD curl -f http://localhost:${PORT}/api/health || exit 1
 
 ENTRYPOINT ["./ozymem-server", "--web"]
