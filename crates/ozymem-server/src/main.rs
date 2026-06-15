@@ -484,9 +484,11 @@ async fn run_web_server(connection_cell: Arc<OnceCell<MemgraphConnection>>) -> a
     // Max 10MB request body to prevent memory exhaustion attacks
     let body_limit = tower_http::limit::RequestBodyLimitLayer::new(10 * 1024 * 1024);
     
-    let app = Router::new()
+    let public_routes = Router::new()
         .route("/api/ping", get(handle_ping))
-        .route("/api/health", get(handle_health))
+        .route("/api/health", get(handle_health));
+
+    let protected_routes = Router::new()
         .route("/api/clear", post(handle_clear))
         .route("/api/file-definition", post(handle_file_definition))
         .route("/api/dependency-relation", post(handle_dependency_relation))
@@ -502,14 +504,16 @@ async fn run_web_server(connection_cell: Arc<OnceCell<MemgraphConnection>>) -> a
         .route("/api/file-context", get(handle_file_context))
         .route("/api/graph-summary", get(handle_graph_summary))
         .route("/api/find-symbol", get(handle_find_symbol))
-        // IAM & GPR endpoints
         .route("/api/team/create", post(handle_create_user))
         .route("/api/gpr/push", post(handle_gpr_push))
         .route("/api/gpr/list", get(handle_gpr_list))
         .route("/api/gpr/diff", get(handle_gpr_diff))
         .route("/api/gpr/merge", post(handle_gpr_merge))
+        .layer(middleware::from_fn_with_state(connection_cell.clone(), auth_middleware));
+
+    let app = public_routes
+        .merge(protected_routes)
         .layer(body_limit)
-        .layer(middleware::from_fn_with_state(connection_cell.clone(), auth_middleware))
         .layer(middleware::from_fn(rate_limit_middleware))
         .with_state(connection_cell);
 
