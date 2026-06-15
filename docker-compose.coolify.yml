@@ -1,6 +1,3 @@
-# Coolify Docker Compose
-# Image must be pre-built: docker build -t ozymem-server:latest .
-
 services:
   memgraph:
     image: memgraph/memgraph:latest
@@ -45,6 +42,9 @@ services:
           cpus: '0.5'
 
   server:
+    build:
+      context: .
+      dockerfile: Dockerfile
     image: ozymem-server:latest
     container_name: ozymem-server
     restart: always
