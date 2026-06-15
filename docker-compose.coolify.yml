@@ -1,14 +1,56 @@
-# Coolify Docker Compose (for reference)
-# Server uses Dockerfile build in Coolify
-# Memgraph + Lab run via docker run on the server
+# Coolify Docker Compose
+# Image must be pre-built: docker build -t ozymem-server:latest .
 
 services:
+  memgraph:
+    image: memgraph/memgraph:latest
+    container_name: ozymem-memgraph
+    restart: always
+    ports:
+      - "7687:7687"
+    volumes:
+      - memgraph-data:/var/lib/memgraph
+    environment:
+      MEMGRAPH_USER: ${MEMGRAPH_USER}
+      MEMGRAPH_PASSWORD: ${MEMGRAPH_PASSWORD}
+    healthcheck:
+      test: ["CMD-SHELL", "echo 'RETURN 1;' | mg_console --host localhost --port 7687 || exit 0"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: '2'
+
+  memgraph-lab:
+    image: memgraph/lab:latest
+    container_name: ozymem-memgraph-lab
+    restart: always
+    depends_on:
+      memgraph:
+        condition: service_healthy
+    ports:
+      - "7474:3000"
+    environment:
+      PORT: "3000"
+      QUICK_CONNECT_MG_HOST: host.docker.internal
+      QUICK_CONNECT_MG_PORT: "7687"
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '0.5'
+
   server:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    image: ozymem-server:latest
     container_name: ozymem-server
     restart: always
+    depends_on:
+      memgraph:
+        condition: service_healthy
     ports:
       - "5857:5857"
     environment:
@@ -24,3 +66,7 @@ services:
       timeout: 10s
       retries: 3
       start_period: 30s
+
+volumes:
+  memgraph-data:
+    driver: local

@@ -42,9 +42,7 @@ services:
           cpus: '0.5'
 
   server:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    image: ozymem-server:latest
     container_name: ozymem-server
     restart: always
     depends_on:
