@@ -46,8 +46,6 @@ fn validate_environment() -> anyhow::Result<()> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    eprintln!("[ozymem] starting up...");
-    
     // Initialize tracing with env-filter (default: info level)
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -56,13 +54,11 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    eprintln!("[ozymem] validating environment...");
     validate_environment()?;
 
     let is_web = std::env::args().any(|arg| arg == "--web")
         || std::env::var("OZYMEM_SERVER_MODE").as_deref() == Ok("web");
 
-    eprintln!("[ozymem] mode={}", if is_web { "web" } else { "stdio" });
     let connection_cell = Arc::new(OnceCell::new());
 
     if is_web {

@@ -57,9 +57,6 @@ WORKDIR /app
 # Copy the binary from builder
 COPY --from=real-builder /app/target/release/ozymem-server .
 
-# Verify binary exists and is executable
-RUN ls -la /app/ozymem-server
-
 # Set ownership
 RUN chown -R ozymem:ozymem /app
 
@@ -70,14 +67,12 @@ ENV PORT=8080
 ENV OZYMEM_SERVER_MODE=web
 ENV MEMGRAPH_URI=memgraph:7687
 ENV MEMGRAPH_DATABASE=memgraph
-ENV RUST_BACKTRACE=1
+ENV RUST_LOG=info
 
 EXPOSE 8080
 
-# Health check - increased start-period for slow cold starts
+# Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
     CMD curl -f http://localhost:${PORT}/api/ping || exit 1
 
-ENV RUST_LOG=info
-
-CMD echo "=== Ozymem starting ===" && echo "PORT=$PORT MODE=$OZYMEM_SERVER_MODE URI=$MEMGRAPH_URI" && exec ./ozymem-server --web
+ENTRYPOINT ["./ozymem-server", "--web"]
