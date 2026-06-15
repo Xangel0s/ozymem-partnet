@@ -49,9 +49,7 @@ services:
       - ozymem-network
 
   server:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    image: ghcr.io/xangel0s/ozymem-partnet:latest
     container_name: ozymem-server
     restart: always
     depends_on:
