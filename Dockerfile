@@ -2,7 +2,7 @@
 # Compatible with Coolify, Docker, and docker-compose
 
 # Stage 1: Builder with dependency caching
-FROM rust:1.75-slim as builder
+FROM rust:1.87-slim AS builder
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
@@ -30,7 +30,7 @@ COPY crates/ozymem-server/Cargo.toml crates/ozymem-server/
 RUN cargo build --release --bin ozymem-server 2>/dev/null || true
 
 # Stage 2: Build actual application
-FROM builder as real-builder
+FROM builder AS real-builder
 
 # Copy real source code (overwrites dummy files)
 COPY crates/ crates/
