@@ -54,16 +54,16 @@ services:
       memgraph:
         condition: service_healthy
     ports:
-      - "8080:8080"
+      - "5857:5857"
     environment:
       - MEMGRAPH_URI=memgraph:7687
       - MEMGRAPH_USER=${MEMGRAPH_USER}
       - MEMGRAPH_PASSWORD=${MEMGRAPH_PASSWORD}
       - MEMGRAPH_DATABASE=${MEMGRAPH_DATABASE:-memgraph}
-      - PORT=8080
+      - PORT=5857
       - OZYMEM_SERVER_MODE=web
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/api/ping"]
+      test: ["CMD", "curl", "-f", "http://localhost:5857/api/ping"]
       interval: 30s
       timeout: 10s
       retries: 3
