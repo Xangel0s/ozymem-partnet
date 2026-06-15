@@ -485,6 +485,7 @@ async fn run_web_server(connection_cell: Arc<OnceCell<MemgraphConnection>>) -> a
     let body_limit = tower_http::limit::RequestBodyLimitLayer::new(10 * 1024 * 1024);
     
     let app = Router::new()
+        .route("/api/ping", get(handle_ping))
         .route("/api/health", get(handle_health))
         .route("/api/clear", post(handle_clear))
         .route("/api/file-definition", post(handle_file_definition))
@@ -533,6 +534,10 @@ async fn handle_health(
     let conn = get_connection(&conn_cell).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     conn.ping().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(json!({ "status": "ok" })))
+}
+
+async fn handle_ping() -> Result<Json<Value>, StatusCode> {
+    Ok(Json(json!({ "status": "pong" })))
 }
 
 async fn handle_clear(
