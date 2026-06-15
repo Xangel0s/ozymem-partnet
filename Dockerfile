@@ -32,12 +32,11 @@ RUN cargo build --release --bin ozymem-server 2>/dev/null || true
 # Stage 2: Build actual application
 FROM builder as real-builder
 
-# Copy real source code
+# Copy real source code (overwrites dummy files)
 COPY crates/ crates/
 
-# Remove dummy files and rebuild
-RUN rm -f crates/ozymem-core/src/lib.rs crates/ozymem-parser/src/lib.rs crates/ozymem-cli/src/main.rs crates/ozymem-server/src/main.rs \
-    && cargo build --release --bin ozymem-server
+# Rebuild with actual source code
+RUN cargo build --release --bin ozymem-server
 
 # Stage 3: Runtime
 FROM debian:bookworm-slim

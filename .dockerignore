@@ -35,8 +35,3 @@ docker-compose*.yml
 
 # Scripts (not needed in container)
 *.ps1
-*.sh
-
-# Lock files (Cargo.lock should be committed for binaries)
-# But we exclude it here to force fresh dependency resolution
-Cargo.lock
