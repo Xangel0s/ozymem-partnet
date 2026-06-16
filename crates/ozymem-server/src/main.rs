@@ -46,13 +46,6 @@ fn validate_environment() -> anyhow::Result<()> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    eprintln!("[OZYMEM-DEBUG] main() STARTED - pid={}", std::process::id());
-    eprintln!("[OZYMEM-DEBUG] args={:?}", std::env::args().collect::<Vec<_>>());
-    eprintln!("[OZYMEM-DEBUG] PORT={:?}", std::env::var("PORT"));
-    eprintln!("[OZYMEM-DEBUG] MEMGRAPH_URI={:?}", std::env::var("MEMGRAPH_URI"));
-    eprintln!("[OZYMEM-DEBUG] MEMGRAPH_USER={:?}", std::env::var("MEMGRAPH_USER"));
-    eprintln!("[OZYMEM-DEBUG] OZYMEM_SERVER_MODE={:?}", std::env::var("OZYMEM_SERVER_MODE"));
-
     // Initialize tracing with env-filter (default: info level)
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -61,27 +54,32 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    eprintln!("[OZYMEM-DEBUG] tracing initialized");
+    let port = std::env::var("PORT")
+        .ok()
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or(8080);
 
-    if let Err(e) = validate_environment() {
-        eprintln!("[OZYMEM-DEBUG] validate_environment FAILED: {:?}", e);
-        return Err(e);
-    }
-    eprintln!("[OZYMEM-DEBUG] validate_environment OK");
+    eprintln!();
+    eprintln!("  ╔══════════════════════════════════════════════╗");
+    eprintln!("  ║         OZYMEM PARTNER v{}             ║", env!("CARGO_PKG_VERSION"));
+    eprintln!("  ║      Knowledge Graph Backend Server          ║");
+    eprintln!("  ╠══════════════════════════════════════════════╣");
+    eprintln!("  ║  Dashboard:  http://0.0.0.0:{:<5}            ║", port);
+    eprintln!("  ║  Ping:       /api/ping                       ║");
+    eprintln!("  ║  Health:     /api/health                     ║");
+    eprintln!("  ╚══════════════════════════════════════════════╝");
+    eprintln!();
+
+    validate_environment()?;
 
     let is_web = std::env::args().any(|arg| arg == "--web")
         || std::env::var("OZYMEM_SERVER_MODE").as_deref() == Ok("web");
-    eprintln!("[OZYMEM-DEBUG] is_web={}", is_web);
 
     let connection_cell = Arc::new(OnceCell::new());
 
     if is_web {
-        eprintln!("[OZYMEM-DEBUG] entering run_web_server");
-        let result = run_web_server(connection_cell).await;
-        eprintln!("[OZYMEM-DEBUG] run_web_server returned: {:?}", result);
-        result
+        run_web_server(connection_cell).await
     } else {
-        eprintln!("[OZYMEM-DEBUG] entering run_server (stdin)");
         run_server(connection_cell).await
     }
 }
@@ -146,10 +144,19 @@ async fn get_connection(cell: &OnceCell<MemgraphConnection>) -> anyhow::Result<&
                     error!("Genesis setup failed to create user: {:?}", e);
                 } else {
                     info!("Genesis setup complete - empty database detected, created first Lead Developer");
-                    eprintln!("\n================ OZYMEM-PARTNER SETUP ================");
-                    eprintln!("CREDENCIAL MAESTRA GENERADA: {}", master_credential);
-                    eprintln!("Guarda esta credencial de inmediato. La necesitarás para tu CLI local.");
-                    eprintln!("=====================================================\n");
+                    eprintln!();
+                    eprintln!("  ╔══════════════════════════════════════════════╗");
+                    eprintln!("  ║          🚀 GENESIS SETUP COMPLETE          ║");
+                    eprintln!("  ╠══════════════════════════════════════════════╣");
+                    eprintln!("  ║  Primer usuario Lead Developer creado.      ║");
+                    eprintln!("  ║                                              ║");
+                    eprintln!("  ║  CREDENCIAL:                                ║");
+                    eprintln!("  ║  {}", master_credential);
+                    eprintln!("  ║                                              ║");
+                    eprintln!("  ║  ⚠️  Guarda esta credencial de inmediato.   ║");
+                    eprintln!("  ║  La necesitarás para tu CLI local.          ║");
+                    eprintln!("  ╚══════════════════════════════════════════════╝");
+                    eprintln!();
                 }
             }
             Ok(true) => {}
