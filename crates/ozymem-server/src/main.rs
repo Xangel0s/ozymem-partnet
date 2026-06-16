@@ -46,9 +46,6 @@ fn validate_environment() -> anyhow::Result<()> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    eprintln!("[DEBUG] main() started");
-    eprintln!("[DEBUG] args: {:?}", std::env::args().collect::<Vec<_>>());
-
     // Initialize tracing with env-filter (default: info level)
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -57,28 +54,16 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    eprintln!("[DEBUG] tracing initialized");
-
-    if let Err(e) = validate_environment() {
-        eprintln!("[DEBUG] validate_environment FAILED: {:?}", e);
-        return Err(e);
-    }
-    eprintln!("[DEBUG] validate_environment passed");
+    validate_environment()?;
 
     let is_web = std::env::args().any(|arg| arg == "--web")
         || std::env::var("OZYMEM_SERVER_MODE").as_deref() == Ok("web");
 
-    eprintln!("[DEBUG] is_web={}", is_web);
-
     let connection_cell = Arc::new(OnceCell::new());
 
     if is_web {
-        eprintln!("[DEBUG] calling run_web_server");
-        let result = run_web_server(connection_cell).await;
-        eprintln!("[DEBUG] run_web_server returned: {:?}", result);
-        result
+        run_web_server(connection_cell).await
     } else {
-        eprintln!("[DEBUG] calling run_server (stdin mode)");
         run_server(connection_cell).await
     }
 }
