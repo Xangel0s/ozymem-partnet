@@ -35,8 +35,10 @@ FROM builder AS real-builder
 # Copy real source code (overwrites dummy files)
 COPY crates/ crates/
 
-# Rebuild with actual source code
-RUN cargo build --release --bin ozymem-server
+# Force cargo to detect source changes and rebuild
+RUN touch crates/*/src/*.rs crates/*/src/**/*.rs 2>/dev/null; \
+    cargo clean -p ozymem-core -p ozymem-parser -p ozymem-cli -p ozymem-server 2>/dev/null || true; \
+    cargo build --release --bin ozymem-server
 
 # Stage 3: Runtime
 FROM debian:bookworm-slim
