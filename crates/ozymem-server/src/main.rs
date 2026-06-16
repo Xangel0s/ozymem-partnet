@@ -46,6 +46,13 @@ fn validate_environment() -> anyhow::Result<()> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    eprintln!("[OZYMEM-DEBUG] main() STARTED - pid={}", std::process::id());
+    eprintln!("[OZYMEM-DEBUG] args={:?}", std::env::args().collect::<Vec<_>>());
+    eprintln!("[OZYMEM-DEBUG] PORT={:?}", std::env::var("PORT"));
+    eprintln!("[OZYMEM-DEBUG] MEMGRAPH_URI={:?}", std::env::var("MEMGRAPH_URI"));
+    eprintln!("[OZYMEM-DEBUG] MEMGRAPH_USER={:?}", std::env::var("MEMGRAPH_USER"));
+    eprintln!("[OZYMEM-DEBUG] OZYMEM_SERVER_MODE={:?}", std::env::var("OZYMEM_SERVER_MODE"));
+
     // Initialize tracing with env-filter (default: info level)
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -54,16 +61,27 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    validate_environment()?;
+    eprintln!("[OZYMEM-DEBUG] tracing initialized");
+
+    if let Err(e) = validate_environment() {
+        eprintln!("[OZYMEM-DEBUG] validate_environment FAILED: {:?}", e);
+        return Err(e);
+    }
+    eprintln!("[OZYMEM-DEBUG] validate_environment OK");
 
     let is_web = std::env::args().any(|arg| arg == "--web")
         || std::env::var("OZYMEM_SERVER_MODE").as_deref() == Ok("web");
+    eprintln!("[OZYMEM-DEBUG] is_web={}", is_web);
 
     let connection_cell = Arc::new(OnceCell::new());
 
     if is_web {
-        run_web_server(connection_cell).await
+        eprintln!("[OZYMEM-DEBUG] entering run_web_server");
+        let result = run_web_server(connection_cell).await;
+        eprintln!("[OZYMEM-DEBUG] run_web_server returned: {:?}", result);
+        result
     } else {
+        eprintln!("[OZYMEM-DEBUG] entering run_server (stdin)");
         run_server(connection_cell).await
     }
 }
