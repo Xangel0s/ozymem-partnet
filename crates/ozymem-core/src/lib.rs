@@ -211,6 +211,30 @@ impl MemgraphConnection {
         }
     }
 
+    pub async fn count_users_by_role(&self) -> anyhow::Result<Vec<(String, i64)>> {
+        let mut result = self.graph.execute(
+            query("MATCH (u:User) RETURN u.role AS role, count(u) AS count")
+        ).await?;
+        let mut roles = Vec::new();
+        while let Some(row) = result.next().await? {
+            let role: String = row.get("role")?;
+            let count: i64 = row.get("count")?;
+            roles.push((role, count));
+        }
+        Ok(roles)
+    }
+
+    pub async fn count_tenants(&self) -> anyhow::Result<i64> {
+        let mut result = self.graph.execute(
+            query("MATCH (t:Tenant) RETURN count(t) AS tenant_count")
+        ).await?;
+        if let Some(row) = result.next().await? {
+            Ok(row.get::<i64>("tenant_count")?)
+        } else {
+            Ok(0)
+        }
+    }
+
     // Graph Operations (Multitenant)
     pub async fn clear_graph(&self, tenant_id: &str) -> anyhow::Result<()> {
         self.graph.run(

@@ -54,22 +54,6 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let port = std::env::var("PORT")
-        .ok()
-        .and_then(|p| p.parse::<u16>().ok())
-        .unwrap_or(8080);
-
-    eprintln!();
-    eprintln!("  ╔══════════════════════════════════════════════╗");
-    eprintln!("  ║         OZYMEM PARTNER v{}             ║", env!("CARGO_PKG_VERSION"));
-    eprintln!("  ║      Knowledge Graph Backend Server          ║");
-    eprintln!("  ╠══════════════════════════════════════════════╣");
-    eprintln!("  ║  Dashboard:  http://0.0.0.0:{:<5}            ║", port);
-    eprintln!("  ║  Ping:       /api/ping                       ║");
-    eprintln!("  ║  Health:     /api/health                     ║");
-    eprintln!("  ╚══════════════════════════════════════════════╝");
-    eprintln!();
-
     validate_environment()?;
 
     let is_web = std::env::args().any(|arg| arg == "--web")
@@ -125,7 +109,7 @@ async fn get_connection(cell: &OnceCell<MemgraphConnection>) -> anyhow::Result<&
         };
         let conn = MemgraphConnection::connect(config).await?;
         
-        // Setup Génesis if user database is empty
+        // Setup Genesis if user database is empty
         match conn.has_any_users().await {
             Ok(false) => {
                 let master_tenant_id = "default_tenant";
@@ -145,17 +129,29 @@ async fn get_connection(cell: &OnceCell<MemgraphConnection>) -> anyhow::Result<&
                 } else {
                     info!("Genesis setup complete - empty database detected, created first Lead Developer");
                     eprintln!();
-                    eprintln!("  ╔══════════════════════════════════════════════╗");
-                    eprintln!("  ║          🚀 GENESIS SETUP COMPLETE          ║");
-                    eprintln!("  ╠══════════════════════════════════════════════╣");
-                    eprintln!("  ║  Primer usuario Lead Developer creado.      ║");
-                    eprintln!("  ║                                              ║");
-                    eprintln!("  ║  CREDENCIAL:                                ║");
-                    eprintln!("  ║  {}", master_credential);
-                    eprintln!("  ║                                              ║");
-                    eprintln!("  ║  ⚠️  Guarda esta credencial de inmediato.   ║");
-                    eprintln!("  ║  La necesitarás para tu CLI local.          ║");
-                    eprintln!("  ╚══════════════════════════════════════════════╝");
+                    eprintln!("  +=====================================================+");
+                    eprintln!("  |           GENESIS SETUP - FIRST BOOT                 |");
+                    eprintln!("  +=====================================================+");
+                    eprintln!("  |                                                       |");
+                    eprintln!("  |  Empty database detected.                             |");
+                    eprintln!("  |  Creating default tenant and Lead user...             |");
+                    eprintln!("  |                                                       |");
+                    eprintln!("  |  [OK] Tenant:    Default Tenant                       |");
+                    eprintln!("  |  [OK] User:      admin (Lead Developer)               |");
+                    eprintln!("  |                                                       |");
+                    eprintln!("  |  YOUR MASTER CREDENTIAL:                              |");
+                    eprintln!("  |  {}", master_credential);
+                    eprintln!("  |                                                       |");
+                    eprintln!("  |  WARNING: Save this credential now.                   |");
+                    eprintln!("  |  It will not be shown again.                          |");
+                    eprintln!("  |                                                       |");
+                    eprintln!("  |  NEXT STEPS:                                          |");
+                    eprintln!("  |  1. Open http://localhost:5857/ in your browser        |");
+                    eprintln!("  |  2. Install CLI:  cargo install ozymem-cli            |");
+                    eprintln!("  |  3. Authenticate: ozymem login <credential>           |");
+                    eprintln!("  |  4. Push code:    ozymem push                         |");
+                    eprintln!("  |                                                       |");
+                    eprintln!("  +=====================================================+");
                     eprintln!();
                 }
             }
@@ -504,7 +500,11 @@ async fn run_web_server(connection_cell: Arc<OnceCell<MemgraphConnection>>) -> a
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(8080);
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
-    info!("Starting Ozymem-Partner web server on {}", addr);
+
+    let cell_clone = connection_cell.clone();
+    tokio::spawn(async move {
+        print_startup_banner(cell_clone, port).await;
+    });
 
     // Max 10MB request body to prevent memory exhaustion attacks
     let body_limit = tower_http::limit::RequestBodyLimitLayer::new(10 * 1024 * 1024);
@@ -512,7 +512,9 @@ async fn run_web_server(connection_cell: Arc<OnceCell<MemgraphConnection>>) -> a
     let public_routes = Router::new()
         .route("/", get(handle_dashboard))
         .route("/api/ping", get(handle_ping))
-        .route("/api/health", get(handle_health));
+        .route("/api/health", get(handle_health))
+        .route("/api/status", get(handle_status))
+        .with_state(connection_cell.clone());
 
     let protected_routes = Router::new()
         .route("/api/clear", post(handle_clear))
@@ -558,6 +560,72 @@ async fn run_web_server(connection_cell: Arc<OnceCell<MemgraphConnection>>) -> a
     Ok(())
 }
 
+async fn print_startup_banner(connection_cell: Arc<OnceCell<MemgraphConnection>>, port: u16) {
+    let mut memgraph_ok = false;
+    let mut user_stats: Vec<(String, i64)> = Vec::new();
+    let mut tenant_count: i64 = 0;
+    let mut file_count: i64 = 0;
+    let mut function_count: i64 = 0;
+
+    match get_connection(&connection_cell).await {
+        Ok(conn) => {
+            memgraph_ok = true;
+            if let Ok(roles) = conn.count_users_by_role().await {
+                user_stats = roles;
+            }
+            if let Ok(tenants) = conn.count_tenants().await {
+                tenant_count = tenants;
+            }
+            if let Ok(summary) = conn.get_graph_summary("default_tenant").await {
+                file_count = summary.file_count;
+                function_count = summary.function_count;
+            }
+        }
+        Err(e) => {
+            warn!("Could not connect to Memgraph for startup banner: {:?}", e);
+        }
+    }
+
+    let total_users: i64 = user_stats.iter().map(|(_, c)| c).sum();
+    let mg_status = if memgraph_ok { "[CONNECTED]" } else { "[DISCONNECTED]" };
+
+    eprintln!();
+    eprintln!("  +=====================================================+");
+    eprintln!("  |         OZYMEM PARTNER v{:<27}|", format!("{} ", env!("CARGO_PKG_VERSION")));
+    eprintln!("  |         Knowledge Graph Backend Server              |");
+    eprintln!("  +=====================================================+");
+    eprintln!("  |                                                       |");
+    eprintln!("  |  Server:    http://0.0.0.0:{:<5}                     |", port);
+    eprintln!("  |  Ping:      /api/ping                                |");
+    eprintln!("  |  Health:    /api/health                              |");
+    eprintln!("  |  Status:    /api/status                              |");
+    eprintln!("  |  Memgraph:  bolt://memgraph:7687  {:<20}|", mg_status);
+    eprintln!("  |                                                       |");
+
+    if memgraph_ok {
+        let roles_str = if user_stats.is_empty() {
+            "none".to_string()
+        } else {
+            user_stats.iter()
+                .map(|(role, count)| format!("{}: {}", role, count))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        eprintln!("  |  Users:     {:<41}|", format!("{} total ({})", total_users, roles_str));
+        eprintln!("  |  Tenants:   {:<41}|", tenant_count);
+        eprintln!("  |  Graph:     {:<41}|", format!("{} files, {} functions", file_count, function_count));
+        eprintln!("  |                                                       |");
+        eprintln!("  |  Dashboard: http://localhost:{}/                     |", port);
+    } else {
+        eprintln!("  |  WARNING: Memgraph connection failed.                |");
+        eprintln!("  |  Check MEMGRAPH_URI, MEMGRAPH_USER, MEMGRAPH_PASSWORD|");
+        eprintln!("  |                                                       |");
+    }
+
+    eprintln!("  +=====================================================+");
+    eprintln!();
+}
+
 async fn handle_health(
     State(conn_cell): State<Arc<OnceCell<MemgraphConnection>>>,
 ) -> Result<Json<Value>, StatusCode> {
@@ -572,6 +640,42 @@ async fn handle_ping() -> Result<Json<Value>, StatusCode> {
 
 async fn handle_dashboard() -> Html<&'static str> {
     Html(DASHBOARD_HTML)
+}
+
+async fn handle_status(
+    State(conn_cell): State<Arc<OnceCell<MemgraphConnection>>>,
+) -> Result<Json<Value>, StatusCode> {
+    let mut response = json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "memgraph_connected": false,
+        "users": {},
+        "tenants": 0,
+        "files": 0,
+        "functions": 0,
+    });
+
+    if let Ok(conn) = get_connection(&conn_cell).await {
+        response["memgraph_connected"] = json!(true);
+
+        if let Ok(roles) = conn.count_users_by_role().await {
+            let mut users_map = serde_json::Map::new();
+            for (role, count) in roles {
+                users_map.insert(role, json!(count));
+            }
+            response["users"] = Value::Object(users_map);
+        }
+
+        if let Ok(tenants) = conn.count_tenants().await {
+            response["tenants"] = json!(tenants);
+        }
+
+        if let Ok(summary) = conn.get_graph_summary("default_tenant").await {
+            response["files"] = json!(summary.file_count);
+            response["functions"] = json!(summary.function_count);
+        }
+    }
+
+    Ok(Json(response))
 }
 
 async fn handle_clear(
@@ -891,7 +995,7 @@ async fn handle_gpr_merge(
 }
 
 const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
-<html lang="es">
+<html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -906,6 +1010,10 @@ h1{font-size:28px;color:#fff;margin-bottom:8px}
 .badge{padding:6px 14px;border-radius:20px;font-size:12px;font-weight:600}
 .badge.ok{background:#052e16;color:#4ade80;border:1px solid #166534}
 .badge.err{background:#450a0a;color:#f87171;border:1px solid #991b1b}
+.stats{background:#1a1a2e;border:1px solid #2a2a4a;border-radius:10px;padding:16px;margin-bottom:24px;text-align:left;font-size:13px;line-height:1.8}
+.stats .row{display:flex;justify-content:space-between}
+.stats .label{color:#8888cc}
+.stats .value{color:#e0e0e0;font-weight:600}
 .links{display:flex;flex-direction:column;gap:12px}
 .link{display:flex;align-items:center;justify-content:space-between;background:#1a1a2e;border:1px solid #2a2a4a;border-radius:10px;padding:16px 20px;text-decoration:none;color:#e0e0e0;transition:border-color .2s}
 .link:hover{border-color:#6366f1}
@@ -923,9 +1031,19 @@ h1{font-size:28px;color:#fff;margin-bottom:8px}
 <span class="badge" id="api-status">checking...</span>
 <span class="badge" id="mg-status">checking...</span>
 </div>
+<div class="stats" id="stats-panel" style="display:none">
+<div class="row"><span class="label">Users</span><span class="value" id="stat-users">-</span></div>
+<div class="row"><span class="label">Tenants</span><span class="value" id="stat-tenants">-</span></div>
+<div class="row"><span class="label">Files</span><span class="value" id="stat-files">-</span></div>
+<div class="row"><span class="label">Functions</span><span class="value" id="stat-functions">-</span></div>
+</div>
 <div class="links">
 <a class="link" href="/api/ping" target="_blank">
-<div><div class="label">API Health</div><div class="desc">GET /api/ping</div></div>
+<div><div class="label">API Ping</div><div class="desc">GET /api/ping</div></div>
+<span class="arrow">&rarr;</span>
+</a>
+<a class="link" href="/api/status" target="_blank">
+<div><div class="label">Server Status</div><div class="desc">GET /api/status (public)</div></div>
 <span class="arrow">&rarr;</span>
 </a>
 <a class="link" id="lab-link" href="#" target="_blank">
@@ -937,7 +1055,7 @@ h1{font-size:28px;color:#fff;margin-bottom:8px}
 <span class="arrow">&rarr;</span>
 </a>
 </div>
-<div class="footer">Ozymem Partner v0.1.0</div>
+<div class="footer">Ozymem Partner</div>
 </div>
 <script>
 (async()=>{
@@ -950,6 +1068,14 @@ h1{font-size:28px;color:#fff;margin-bottom:8px}
   try{const r2=await fetch('http://'+host+':7474',{mode:'no-cors'});
     document.getElementById('mg-status').textContent='Memgraph Lab';document.getElementById('mg-status').className='badge ok'}
   catch{document.getElementById('mg-status').textContent='Memgraph Lab';document.getElementById('mg-status').className='badge ok'}
+  try{const s=await fetch('/api/status');
+    if(s.ok){const d=await s.json();document.getElementById('stats-panel').style.display='block';
+    const roles=Object.entries(d.users||{}).map(([r,c])=>r+':'+c).join(', ')||'none';
+    document.getElementById('stat-users').textContent=roles;
+    document.getElementById('stat-tenants').textContent=d.tenants||0;
+    document.getElementById('stat-files').textContent=d.files||0;
+    document.getElementById('stat-functions').textContent=d.functions||0}}
+  catch{}
 })();
 </script>
 </body>

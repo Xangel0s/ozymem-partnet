@@ -589,6 +589,22 @@ fn indent_width(line: &str) -> usize {
         .count()
 }
 
+pub fn is_binary_file(path: &std::path::Path) -> bool {
+    let path_str = path.to_string_lossy().to_lowercase();
+    if path_str.ends_with(".tar.gz") {
+        return true;
+    }
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        let ext = ext.to_lowercase();
+        matches!(
+            ext.as_str(),
+            "pdf" | "rar" | "zip" | "jpeg" | "jpg" | "png" | "exe" | "gif" | "ico" | "bin" | "tar" | "gz" | "7z"
+        )
+    } else {
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -721,22 +737,6 @@ use ozymem_core::MemgraphConnection;
         let lines: Vec<&str> = source.lines().collect();
         let end = find_brace_block_end(&lines, 0);
         assert_eq!(end, 5);
-    }
-}
-
-pub fn is_binary_file(path: &std::path::Path) -> bool {
-    let path_str = path.to_string_lossy().to_lowercase();
-    if path_str.ends_with(".tar.gz") {
-        return true;
-    }
-    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-        let ext = ext.to_lowercase();
-        matches!(
-            ext.as_str(),
-            "pdf" | "rar" | "zip" | "jpeg" | "jpg" | "png" | "exe" | "gif" | "ico" | "bin" | "tar" | "gz" | "7z"
-        )
-    } else {
-        false
     }
 }
 
